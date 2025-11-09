@@ -741,6 +741,11 @@ class MainWindow(QWidget):
         self.status.setToolTip("")
         self._update_controls(running=True)
         self._resize_window_to_device()
+        # Trigger a follow-up resize once the event loop has processed the
+        # scrcpy window embedding. Without this deferred call the phone feed
+        # may appear at an incorrect scale until the user manually resizes the
+        # window or the periodic timer fires.
+        QTimer.singleShot(0, self._resize_window_to_device)
 
     def _on_stream_stopped(self) -> None:
         self.status.setText(f"{self._device_label()} — STOPPED")
