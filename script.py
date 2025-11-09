@@ -204,6 +204,13 @@ def _resolve_sndcpy() -> Optional[str]:
     return which("sndcpy")
 
 
+def _is_sndcpy_start_prompt(text: str) -> bool:
+    """Return ``True`` when the prompt requests audio forwarding to start."""
+
+    stop_keywords = ("stop", "exit", "quit", "close")
+    return not any(keyword in text for keyword in stop_keywords)
+
+
 def list_connected_devices() -> List[DeviceInfo]:
     """Return all devices reported by ``adb devices``."""
 
@@ -550,7 +557,11 @@ class ScrcpyController(QObject):
                 logger.debug("sndcpy: %s", stripped)
 
             lower = line.lower()
-            if "press enter" in lower and not self._sndcpy_prompt_ack:
+            if (
+                "press enter" in lower
+                and not self._sndcpy_prompt_ack
+                and _is_sndcpy_start_prompt(lower)
+            ):
                 # Acknowledge the first "Press Enter" prompt so playback can
                 # begin automatically. Subsequent prompts (for stopping
                 # playback) are ignored because ``_sndcpy_prompt_ack`` will be
@@ -569,7 +580,7 @@ class ScrcpyController(QObject):
         if not proc or not proc.stdin:
             return
         try:
-            proc.stdin.write("\n")
+            proc.stdin.write("\r\n")
             proc.stdin.flush()
             self._sndcpy_prompt_ack = True
         except Exception as exc:  # noqa: BLE001
