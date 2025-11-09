@@ -548,7 +548,13 @@ class ScrcpyController(QObject):
             stripped = line.strip()
             if stripped:
                 logger.debug("sndcpy: %s", stripped)
-            if "press enter" in line.lower():
+
+            lower = line.lower()
+            if "press enter" in lower and not self._sndcpy_prompt_ack:
+                # Acknowledge the first "Press Enter" prompt so playback can
+                # begin automatically. Subsequent prompts (for stopping
+                # playback) are ignored because ``_sndcpy_prompt_ack`` will be
+                # ``True`` after the initial acknowledgement.
                 self._send_sndcpy_enter()
 
         try:
