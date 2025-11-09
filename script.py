@@ -7,8 +7,10 @@ import os
 import re
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from queue import Empty, SimpleQueue
+from typing import IO, List, Optional, Tuple
 
 from datetime import datetime
 
@@ -124,6 +126,7 @@ class ScrcpyController(QObject):
     started = pyqtSignal()
     stopped = pyqtSignal()
     error = pyqtSignal(str)
+    audio_unavailable = pyqtSignal(str)
 
     def __init__(self, serial: Optional[str]):
         super().__init__()
@@ -134,6 +137,14 @@ class ScrcpyController(QObject):
         self.poll = QTimer(self)
         self.poll.setInterval(250)
         self.poll.timeout.connect(self._find_window)
+        self._stderr_timer = QTimer(self)
+        self._stderr_timer.setInterval(200)
+        self._stderr_timer.timeout.connect(self._drain_process_output)
+        self._stderr_queue: SimpleQueue[str] = SimpleQueue()
+        self._stderr_thread: Optional[threading.Thread] = None
+        self._audio_requested = False
+        self._audio_warning_emitted = False
+        self._stopping = False
 
     @property
     def is_running(self) -> bool:
@@ -182,6 +193,11 @@ class ScrcpyController(QObject):
 
         self._update_resolution()
 
+        self._audio_requested = audio
+        self._audio_warning_emitted = False
+        self._stderr_queue = SimpleQueue()
+        self._stderr_thread = None
+
         args = [exe, *options.to_arguments()]
         if self.serial:
             args.insert(1, "-s")
@@ -190,14 +206,21 @@ class ScrcpyController(QObject):
         creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 
         try:
+            popen_kwargs = {"stderr": subprocess.PIPE, "text": True, "bufsize": 1}
             if creation_flags:
-                self.proc = subprocess.Popen(args, creationflags=creation_flags)
+                self.proc = subprocess.Popen(
+                    args, creationflags=creation_flags, **popen_kwargs
+                )
             else:
-                self.proc = subprocess.Popen(args)
+                self.proc = subprocess.Popen(args, **popen_kwargs)
         except Exception as exc:  # noqa: BLE001 - broad to surface error to UI
             logger.error("Failed to start scrcpy: %s", exc)
             self.error.emit(str(exc))
             return
+
+        if self.proc and self.proc.stderr:
+            self._start_output_reader(self.proc.stderr)
+            self._stderr_timer.start()
 
         logger.debug("Started scrcpy with args: %s", args)
         self.poll.start()
@@ -205,10 +228,12 @@ class ScrcpyController(QObject):
     def stop(self) -> None:
         """Terminate the scrcpy process if it is running."""
 
+        self._stderr_timer.stop()
         self.poll.stop()
 
         if self.proc and self.proc.poll() is None:
             try:
+                self._stopping = True
                 self.proc.terminate()
                 self.proc.wait(timeout=2)
             except subprocess.TimeoutExpired:
@@ -216,6 +241,12 @@ class ScrcpyController(QObject):
                 self.proc.kill()
             except Exception as exc:  # noqa: BLE001 - ensure clean shutdown
                 logger.error("Error while stopping scrcpy: %s", exc)
+            finally:
+                self._stopping = False
+        else:
+            self._stopping = False
+
+        self._clear_output_queue()
 
         self.proc = None
         self.hwnd = None
@@ -254,6 +285,67 @@ class ScrcpyController(QObject):
                 return
 
         self.resolution = None
+
+    def _start_output_reader(self, stream: IO[str]) -> None:
+        def _reader() -> None:
+            for line in iter(stream.readline, ""):
+                self._stderr_queue.put(line)
+            stream.close()
+
+        self._stderr_thread = threading.Thread(
+            target=_reader, name="scrcpy-stderr", daemon=True
+        )
+        self._stderr_thread.start()
+
+    def _drain_process_output(self) -> None:
+        if not self.proc:
+            self._stderr_timer.stop()
+            self._clear_output_queue()
+            return
+
+        while True:
+            try:
+                line = self._stderr_queue.get_nowait()
+            except Empty:
+                break
+            self._handle_scrcpy_log_line(line)
+
+        if self.proc and self.proc.poll() is not None:
+            code = self.proc.returncode
+            unexpected = not self._stopping and code not in (0, None)
+            self._stderr_timer.stop()
+            self.stop()
+            if unexpected:
+                message = (
+                    f"scrcpy exited unexpectedly with code {code}."
+                    if code is not None
+                    else "scrcpy exited unexpectedly."
+                )
+                self.error.emit(message)
+
+    def _handle_scrcpy_log_line(self, line: str) -> None:
+        stripped = line.strip()
+        if stripped:
+            logger.debug("scrcpy stderr: %s", stripped)
+        if (
+            self._audio_requested
+            and not self._audio_warning_emitted
+            and (
+                "Cannot create AudioRecord" in line
+                or "stream explicitly disabled by the device" in line
+            )
+        ):
+            self._audio_warning_emitted = True
+            self.audio_unavailable.emit(
+                "Audio capture is not available on this device. Streaming will continue without audio."
+            )
+
+    def _clear_output_queue(self) -> None:
+        while True:
+            try:
+                self._stderr_queue.get_nowait()
+            except Empty:
+                break
 
 
 class AndroidView(QWidget):
@@ -494,6 +586,7 @@ class MainWindow(QWidget):
         self.ctrl.started.connect(self._on_stream_started)
         self.ctrl.stopped.connect(self._on_stream_stopped)
         self.ctrl.error.connect(self._on_error)
+        self.ctrl.audio_unavailable.connect(self._on_audio_unavailable)
 
         config_bar = QWidget()
         config_layout = QHBoxLayout(config_bar)
@@ -609,6 +702,14 @@ class MainWindow(QWidget):
         self.status.setText(f"{self._device_label()} — ERROR")
         QMessageBox.critical(self, "scrcpy", message)
         self._update_controls(running=False)
+
+    def _on_audio_unavailable(self, message: str) -> None:
+        was_blocked = self.audioCheck.blockSignals(True)
+        self.audioCheck.setChecked(False)
+        self.audioCheck.blockSignals(was_blocked)
+        if self.ctrl.is_running:
+            self.status.setText(f"{self._device_label()} — STREAMING (NO AUDIO)")
+        QMessageBox.warning(self, "scrcpy", message)
 
     def _resize_window_to_device(self) -> None:
         if not self.ctrl.resolution:
