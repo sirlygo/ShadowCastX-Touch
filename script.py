@@ -776,7 +776,12 @@ class MainWindow(QWidget):
             QMessageBox.warning(self, "Screenshot", "No primary screen available.")
             return
 
-        pixmap = screen.grabWindow(self.view.winId())
+        target_window = self.ctrl.hwnd if self.ctrl.hwnd else int(self.view.winId())
+        pixmap = screen.grabWindow(int(target_window))
+        if pixmap.isNull() and target_window != int(self.view.winId()):
+            # Fallback to grabbing the Qt wrapper widget if capturing the
+            # embedded scrcpy window fails for any reason.
+            pixmap = screen.grabWindow(int(self.view.winId()))
         if pixmap.isNull():
             QMessageBox.warning(self, "Screenshot", "Unable to capture screenshot.")
             return
