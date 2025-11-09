@@ -1,48 +1,131 @@
 # script.py — Embedded scrcpy window inside PyQt5 (Windows)
 # Works with scrcpy 3.x (uses --video-bit-rate and --window-borderless)
 
+"""PyQt5 wrapper around scrcpy that embeds the mirror directly in a window.
+
+This module provides a small desktop utility that launches ``scrcpy`` in a
+borderless child window, allows taking screenshots and offers a modern crop
+dialog.  It is intentionally self-contained so the project can be distributed
+as a single file while still remaining readable and maintainable.
+
+The previous iteration of the script grew organically and leaned heavily on
+global configuration, bare ``except`` clauses and ad-hoc signal management.
+The refactor introduces structured configuration via ``dataclasses``, richer
+type information, explicit error messages and a few quality-of-life
+improvements inside the UI layer.
+"""
+
+from __future__ import annotations
+
+import logging
 import os
 import sys
 import subprocess
-from typing import Optional
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Optional, Sequence
 
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QRect, QSize, QEvent
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QRect, QSize, QEvent, QPoint
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFrame, QMessageBox, QSizePolicy,
     QDialog, QDialogButtonBox, QInputDialog, QRubberBand
 )
 
-import win32con, win32gui
+import win32con
+import win32gui
+
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # ====== CONFIG ======
+# Note: the default executable path is intentionally Windows-centric because
+# scrcpy embeds a native Win32 window.  Users can override it with
+# ``SCRCPY_EXE`` in their environment.
 SCRCPY_EXE = r"C:\Users\hilli\PycharmProjects\adbhelper\.venv\scrcpy\scrcpy.exe"
 DEVICE_SERIAL: Optional[str] = None  # e.g. "R5CT60SV0RX"
 SCRCPY_TITLE = "Android (Embedded)"
 DEFAULT_MAX_FPS = 60
 DEFAULT_BITRATE = "16M"
+IMAGES_DIR = Path("images")
 # ====================
 
 
 def _resolve_scrcpy() -> Optional[str]:
-    if SCRCPY_EXE and os.path.isfile(SCRCPY_EXE):
-        return SCRCPY_EXE
-    env = os.environ.get("SCRCPY_EXE")
-    if env and os.path.isfile(env):
-        return env
+    """Return the path to the scrcpy executable if it can be located."""
+
+    candidates: Sequence[str] = [
+        SCRCPY_EXE,
+        os.environ.get("SCRCPY_EXE", ""),
+    ]
+
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+
     from shutil import which
-    return which("scrcpy")
+
+    resolved = which("scrcpy")
+    if not resolved:
+        logger.debug("scrcpy executable not found in PATH")
+    return resolved
 
 
 def get_first_device() -> Optional[str]:
+    """Return the first connected device id or ``None`` if nothing is found."""
+
     try:
-        out = subprocess.check_output(["adb", "devices"], stderr=subprocess.STDOUT).decode("utf-8","ignore")
-        for line in out.splitlines()[1:]:
-            if "\tdevice" in line:
-                return line.split("\t")[0]
-    except:
-        pass
+        out = subprocess.check_output(
+            ["adb", "devices"],
+            stderr=subprocess.STDOUT,
+        ).decode("utf-8", "ignore")
+    except FileNotFoundError:
+        logger.warning("adb executable was not found on PATH")
+        return None
+    except subprocess.CalledProcessError as exc:  # pragma: no cover - defensive
+        logger.error("Failed to query adb devices: %s", exc.output)
+        return None
+
+    for line in out.splitlines()[1:]:  # skip header
+        if "\tdevice" in line:
+            return line.split("\t", 1)[0]
     return None
+
+
+@dataclass(frozen=True)
+class ScrcpyProcessConfig:
+    """Configuration container for launching a scrcpy process."""
+
+    max_fps: int = DEFAULT_MAX_FPS
+    bitrate: str = DEFAULT_BITRATE
+    stay_awake: bool = True
+    audio: bool = False
+    window_title: str = SCRCPY_TITLE
+    window_borderless: bool = True
+
+    def flags(self) -> Iterable[str]:
+        """Yield command-line arguments based on the configuration."""
+
+        if self.window_title:
+            yield f"--window-title={self.window_title}"
+        if self.window_borderless:
+            yield "--window-borderless"
+        yield f"--max-fps={self.max_fps}"
+        yield f"--video-bit-rate={self.bitrate}"
+        if self.stay_awake:
+            yield "--stay-awake"
+        if not self.audio:
+            yield "--no-audio"
+
+    def build_args(self, exe: str, serial: Optional[str]) -> list[str]:
+        """Return the full argument list for ``subprocess.Popen``."""
+
+        args = [exe]
+        if serial:
+            args.extend(["-s", serial])
+        args.extend(self.flags())
+        return args
 
 
 class ScrcpyController(QObject):
@@ -52,15 +135,29 @@ class ScrcpyController(QObject):
 
     def __init__(self, serial: Optional[str]):
         super().__init__()
-        self.serial = serial
-        self.proc = None
-        self.hwnd = None
-        self.resolution = None
-        self.poll = QTimer()
+        self.serial: Optional[str] = serial
+        self.proc: Optional[subprocess.Popen] = None
+        self.hwnd: Optional[int] = None
+        self.resolution: Optional[tuple[int, int]] = None
+        self.poll = QTimer(self)
         self.poll.setInterval(250)
         self.poll.timeout.connect(self._find_window)
 
-    def start(self, fps=DEFAULT_MAX_FPS, bitrate=DEFAULT_BITRATE):
+    @property
+    def is_running(self) -> bool:
+        """Return ``True`` if the scrcpy process is currently alive."""
+
+        return self.proc is not None and self.proc.poll() is None
+
+    def start(self, config: Optional[ScrcpyProcessConfig] = None):
+        """Launch scrcpy and embed the resulting window."""
+
+        if self.is_running:
+            logger.info("scrcpy already running; ignoring duplicate start request")
+            return
+
+        config = config or ScrcpyProcessConfig()
+
         if not self.serial:
             # Refresh the device serial each time we try to start in case a new
             # device has been plugged in since the controller was created.
@@ -73,19 +170,7 @@ class ScrcpyController(QObject):
 
         self._update_resolution()
 
-        args = [
-            exe,
-            f"--window-title={SCRCPY_TITLE}",
-            "--window-borderless",         # ✅ updated for scrcpy 3.2
-            f"--max-fps={fps}",
-            f"--video-bit-rate={bitrate}", # ✅ updated
-            "--stay-awake",
-            "--no-audio",
-        ]
-        if self.serial:
-            args.insert(1, "-s")
-            args.insert(2, self.serial)
-
+        args = config.build_args(exe, self.serial)
         creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 
         try:
@@ -93,17 +178,27 @@ class ScrcpyController(QObject):
                 self.proc = subprocess.Popen(args, creationflags=creation_flags)
             else:
                 self.proc = subprocess.Popen(args)
-        except Exception as e:
-            self.error.emit(str(e))
+        except FileNotFoundError:
+            self.error.emit("Failed to launch scrcpy. Ensure the executable exists.")
+            return
+        except Exception as exc:  # pragma: no cover - defensive
+            self.error.emit(str(exc))
             return
 
+        logger.info("scrcpy started with args: %s", args)
         self.poll.start()
 
     def stop(self):
         self.poll.stop()
         if self.proc and self.proc.poll() is None:
-            try: self.proc.terminate()
-            except: pass
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                logger.warning("scrcpy did not terminate gracefully; killing")
+                self.proc.kill()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.error("Error stopping scrcpy: %s", exc)
         self.proc = None
         self.hwnd = None
         self.stopped.emit()
@@ -122,34 +217,39 @@ class ScrcpyController(QObject):
                 cmd += ["-s", self.serial]
             cmd += ["shell", "wm", "size"]
             out = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode("utf-8", "ignore")
-            for line in out.splitlines():
-                if "Physical size:" in line:
-                    size = line.split(":", 1)[1].strip()
-                    break
-                if "Override size:" in line:
-                    size = line.split(":", 1)[1].strip()
-                    break
-            else:
-                size = None
-            if size:
-                size = size.split()[0]
-                if "x" in size:
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            logger.debug("Failed to query device resolution")
+            self.resolution = None
+            return
+
+        size: Optional[str] = None
+        for line in out.splitlines():
+            if "Physical size:" in line or "Override size:" in line:
+                size = line.split(":", 1)[1].strip()
+                break
+
+        if size:
+            size = size.split()[0]
+            if "x" in size:
+                try:
                     w, h = size.split("x", 1)
                     self.resolution = (int(w), int(h))
                     return
-        except Exception:
-            pass
+                except ValueError:  # pragma: no cover - defensive
+                    logger.debug("Unexpected resolution format: %s", size)
         self.resolution = None
 
 
 class AndroidView(QWidget):
+    """Widget that hosts the scrcpy Win32 window."""
+
     def __init__(self, controller: ScrcpyController):
         super().__init__()
         self.controller = controller
         self.setAttribute(Qt.WA_NativeWindow, True)
         self.setStyleSheet("background:#000;")
         controller.started.connect(self._embed)
-        self.r_timer = QTimer()
+        self.r_timer = QTimer(self)
         self.r_timer.setInterval(1000)
         self.r_timer.timeout.connect(self._resize_child)
         self.r_timer.start()
@@ -218,6 +318,8 @@ class AndroidView(QWidget):
 
 
 class CropDialog(QDialog):
+    """Full-screen dialog that lets the user select a region to save."""
+
     def __init__(self, pixmap, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Crop Screenshot")
@@ -229,7 +331,7 @@ class CropDialog(QDialog):
 
         self._pixmap = pixmap
         self._selection = QRect()
-        self._origin = None
+        self._origin: Optional[QPoint] = None
 
         screen = QApplication.primaryScreen()
         target_size = screen.size() if screen else pixmap.size()
@@ -328,6 +430,8 @@ class CropDialog(QDialog):
 
 
 class MainWindow(QWidget):
+    """Primary window wiring together the controller, view and controls."""
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Android — Embedded scrcpy")
@@ -345,12 +449,12 @@ class MainWindow(QWidget):
         self.status = QLabel(self._device_label())
         self.status.setStyleSheet("color:#bbb;")
 
-        self.btnStart.clicked.connect(lambda: self.ctrl.start())
+        self.btnStart.clicked.connect(self._start_stream)
         self.btnStop.clicked.connect(self.ctrl.stop)
         self.btnScreenshot.clicked.connect(self._capture_screenshot)
         self.ctrl.started.connect(self._on_stream_started)
         self.ctrl.stopped.connect(self._on_stream_stopped)
-        self.ctrl.error.connect(lambda m: QMessageBox.critical(self, "scrcpy", m))
+        self.ctrl.error.connect(self._show_error)
 
         top = QHBoxLayout()
         top.addWidget(self.btnStart)
@@ -371,15 +475,33 @@ class MainWindow(QWidget):
         layout.addWidget(self.view)
         layout.setStretch(2, 1)
 
+        self._sync_button_state()
+
     def _device_label(self) -> str:
         return f"Device: {self.ctrl.serial or 'Not Found'}"
 
     def _on_stream_started(self):
         self.status.setText(f"{self._device_label()} — STREAMING")
         self._resize_window_to_device()
+        self._sync_button_state()
 
     def _on_stream_stopped(self):
         self.status.setText(f"{self._device_label()} — STOPPED")
+        self._sync_button_state()
+
+    def _show_error(self, message: str):
+        QMessageBox.critical(self, "scrcpy", message)
+        self._sync_button_state()
+
+    def _start_stream(self):
+        config = ScrcpyProcessConfig()
+        self.ctrl.start(config)
+        self._sync_button_state()
+
+    def _sync_button_state(self):
+        running = self.ctrl.is_running
+        self.btnStart.setEnabled(not running)
+        self.btnStop.setEnabled(running)
 
     def _resize_window_to_device(self):
         if not self.ctrl.resolution:
@@ -436,29 +558,33 @@ class MainWindow(QWidget):
             return
 
         cropped = dialog.selected_pixmap()
-        name, ok = QInputDialog.getText(self, "Save Screenshot", "File name:", text="screenshot")
+        default_name = "screenshot"
+        name, ok = QInputDialog.getText(
+            self,
+            "Save Screenshot",
+            "File name:",
+            text=default_name,
+        )
         if not ok:
             return
 
-        name = name.strip()
-        if not name:
-            QMessageBox.warning(self, "Screenshot", "File name cannot be empty.")
-            return
-
+        name = name.strip() or default_name
         if not name.lower().endswith(".png"):
             name += ".png"
 
-        os.makedirs("images", exist_ok=True)
-        path = os.path.join("images", name)
+        IMAGES_DIR.mkdir(exist_ok=True)
+        path = IMAGES_DIR / name
 
-        if not cropped.save(path, "PNG"):
+        if not cropped.save(str(path), "PNG"):
             QMessageBox.critical(self, "Screenshot", "Failed to save screenshot.")
             return
 
-        QMessageBox.information(self, "Screenshot", f"Saved screenshot to:\n{os.path.abspath(path)}")
+        QMessageBox.information(self, "Screenshot", f"Saved screenshot to:\n{path.resolve()}")
 
 
 def main():
+    """Entry point for running the PyQt application."""
+
     app = QApplication(sys.argv)
     w = MainWindow()
     w.show()
