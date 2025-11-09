@@ -7,23 +7,30 @@ import os
 import re
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from queue import Empty, SimpleQueue
+from typing import IO, List, Optional, Tuple
+
+from datetime import datetime
 
 from PyQt5.QtCore import QEvent, QRect, QSize, Qt, QTimer, QObject, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QSizePolicy,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
-    QInputDialog,
     QRubberBand,
 )
 
@@ -37,6 +44,8 @@ SCRCPY_TITLE = "Android (Embedded)"
 DEFAULT_MAX_FPS = 60
 DEFAULT_BITRATE = "16M"
 DEFAULT_SCREENSHOT_DIR = "images"
+
+BITRATE_PATTERN = re.compile(r"^\d+(?:\.\d+)?(?:[KMG](?:bit/s)?)?$", re.IGNORECASE)
 # ====================
 
 
@@ -117,6 +126,7 @@ class ScrcpyController(QObject):
     started = pyqtSignal()
     stopped = pyqtSignal()
     error = pyqtSignal(str)
+    audio_unavailable = pyqtSignal(str)
 
     def __init__(self, serial: Optional[str]):
         super().__init__()
@@ -127,6 +137,14 @@ class ScrcpyController(QObject):
         self.poll = QTimer(self)
         self.poll.setInterval(250)
         self.poll.timeout.connect(self._find_window)
+        self._stderr_timer = QTimer(self)
+        self._stderr_timer.setInterval(200)
+        self._stderr_timer.timeout.connect(self._drain_process_output)
+        self._stderr_queue: SimpleQueue[str] = SimpleQueue()
+        self._stderr_thread: Optional[threading.Thread] = None
+        self._audio_requested = False
+        self._audio_warning_emitted = False
+        self._stopping = False
 
     @property
     def is_running(self) -> bool:
@@ -134,7 +152,14 @@ class ScrcpyController(QObject):
 
         return self.proc is not None and self.proc.poll() is None
 
-    def start(self, fps: int = DEFAULT_MAX_FPS, bitrate: str = DEFAULT_BITRATE) -> None:
+    def start(
+        self,
+        fps: int = DEFAULT_MAX_FPS,
+        bitrate: str = DEFAULT_BITRATE,
+        *,
+        stay_awake: bool = True,
+        audio: bool = False,
+    ) -> None:
         """Start scrcpy using the provided configuration values."""
 
         if self.is_running:
@@ -156,12 +181,22 @@ class ScrcpyController(QObject):
             return
 
         try:
-            options = ScrcpyLaunchOptions(max_fps=fps, bitrate=bitrate)
+            options = ScrcpyLaunchOptions(
+                max_fps=fps,
+                bitrate=bitrate,
+                stay_awake=stay_awake,
+                audio=audio,
+            )
         except ValueError as exc:
             self.error.emit(str(exc))
             return
 
         self._update_resolution()
+
+        self._audio_requested = audio
+        self._audio_warning_emitted = False
+        self._stderr_queue = SimpleQueue()
+        self._stderr_thread = None
 
         args = [exe, *options.to_arguments()]
         if self.serial:
@@ -171,14 +206,21 @@ class ScrcpyController(QObject):
         creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 
         try:
+            popen_kwargs = {"stderr": subprocess.PIPE, "text": True, "bufsize": 1}
             if creation_flags:
-                self.proc = subprocess.Popen(args, creationflags=creation_flags)
+                self.proc = subprocess.Popen(
+                    args, creationflags=creation_flags, **popen_kwargs
+                )
             else:
-                self.proc = subprocess.Popen(args)
+                self.proc = subprocess.Popen(args, **popen_kwargs)
         except Exception as exc:  # noqa: BLE001 - broad to surface error to UI
             logger.error("Failed to start scrcpy: %s", exc)
             self.error.emit(str(exc))
             return
+
+        if self.proc and self.proc.stderr:
+            self._start_output_reader(self.proc.stderr)
+            self._stderr_timer.start()
 
         logger.debug("Started scrcpy with args: %s", args)
         self.poll.start()
@@ -186,10 +228,12 @@ class ScrcpyController(QObject):
     def stop(self) -> None:
         """Terminate the scrcpy process if it is running."""
 
+        self._stderr_timer.stop()
         self.poll.stop()
 
         if self.proc and self.proc.poll() is None:
             try:
+                self._stopping = True
                 self.proc.terminate()
                 self.proc.wait(timeout=2)
             except subprocess.TimeoutExpired:
@@ -197,6 +241,12 @@ class ScrcpyController(QObject):
                 self.proc.kill()
             except Exception as exc:  # noqa: BLE001 - ensure clean shutdown
                 logger.error("Error while stopping scrcpy: %s", exc)
+            finally:
+                self._stopping = False
+        else:
+            self._stopping = False
+
+        self._clear_output_queue()
 
         self.proc = None
         self.hwnd = None
@@ -235,6 +285,67 @@ class ScrcpyController(QObject):
                 return
 
         self.resolution = None
+
+    def _start_output_reader(self, stream: IO[str]) -> None:
+        def _reader() -> None:
+            for line in iter(stream.readline, ""):
+                self._stderr_queue.put(line)
+            stream.close()
+
+        self._stderr_thread = threading.Thread(
+            target=_reader, name="scrcpy-stderr", daemon=True
+        )
+        self._stderr_thread.start()
+
+    def _drain_process_output(self) -> None:
+        if not self.proc:
+            self._stderr_timer.stop()
+            self._clear_output_queue()
+            return
+
+        while True:
+            try:
+                line = self._stderr_queue.get_nowait()
+            except Empty:
+                break
+            self._handle_scrcpy_log_line(line)
+
+        if self.proc and self.proc.poll() is not None:
+            code = self.proc.returncode
+            unexpected = not self._stopping and code not in (0, None)
+            self._stderr_timer.stop()
+            self.stop()
+            if unexpected:
+                message = (
+                    f"scrcpy exited unexpectedly with code {code}."
+                    if code is not None
+                    else "scrcpy exited unexpectedly."
+                )
+                self.error.emit(message)
+
+    def _handle_scrcpy_log_line(self, line: str) -> None:
+        stripped = line.strip()
+        if stripped:
+            logger.debug("scrcpy stderr: %s", stripped)
+        if (
+            self._audio_requested
+            and not self._audio_warning_emitted
+            and (
+                "Cannot create AudioRecord" in line
+                or "stream explicitly disabled by the device" in line
+            )
+        ):
+            self._audio_warning_emitted = True
+            self.audio_unavailable.emit(
+                "Audio capture is not available on this device. Streaming will continue without audio."
+            )
+
+    def _clear_output_queue(self) -> None:
+        while True:
+            try:
+                self._stderr_queue.get_nowait()
+            except Empty:
+                break
 
 
 class AndroidView(QWidget):
@@ -441,6 +552,28 @@ class MainWindow(QWidget):
         self.view = AndroidView(self.ctrl)
         self.view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
+        self.fpsSpin = QSpinBox()
+        self.fpsSpin.setRange(1, 240)
+        self.fpsSpin.setValue(DEFAULT_MAX_FPS)
+        self.fpsSpin.setSuffix(" fps")
+        self.fpsSpin.setToolTip("Maximum frames per second to request from scrcpy.")
+        self.fpsSpin.setAccelerated(True)
+
+        self.bitrateInput = QLineEdit(DEFAULT_BITRATE)
+        self.bitrateInput.setPlaceholderText(DEFAULT_BITRATE)
+        self.bitrateInput.setToolTip(
+            "Video bitrate passed to scrcpy. Examples: 16M, 8Mbit/s, 8000K."
+        )
+        self.bitrateInput.setClearButtonEnabled(True)
+        self.bitrateInput.setFixedWidth(110)
+
+        self.stayAwakeCheck = QCheckBox("Keep device awake")
+        self.stayAwakeCheck.setChecked(True)
+
+        self.audioCheck = QCheckBox("Enable audio")
+        self.audioCheck.setToolTip("Capture audio in addition to video when supported.")
+        self.audioCheck.setChecked(False)
+
         self.btnStart = QPushButton("Start Stream")
         self.btnStop = QPushButton("Stop")
         self.btnScreenshot = QPushButton("Screenshot")
@@ -453,6 +586,27 @@ class MainWindow(QWidget):
         self.ctrl.started.connect(self._on_stream_started)
         self.ctrl.stopped.connect(self._on_stream_stopped)
         self.ctrl.error.connect(self._on_error)
+        self.ctrl.audio_unavailable.connect(self._on_audio_unavailable)
+
+        config_bar = QWidget()
+        config_layout = QHBoxLayout(config_bar)
+        config_layout.setContentsMargins(0, 0, 0, 0)
+        config_layout.setSpacing(12)
+
+        fps_label = QLabel("Max FPS:")
+        fps_label.setStyleSheet("color:#bbb;")
+        config_layout.addWidget(fps_label)
+        config_layout.addWidget(self.fpsSpin)
+
+        bitrate_label = QLabel("Bitrate:")
+        bitrate_label.setStyleSheet("color:#bbb;")
+        config_layout.addWidget(bitrate_label)
+        config_layout.addWidget(self.bitrateInput)
+
+        config_layout.addSpacing(10)
+        config_layout.addWidget(self.stayAwakeCheck)
+        config_layout.addWidget(self.audioCheck)
+        config_layout.addStretch(1)
 
         top = QHBoxLayout()
         top.addWidget(self.btnStart)
@@ -468,6 +622,7 @@ class MainWindow(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(6)
+        layout.addWidget(config_bar)
         layout.addLayout(top)
         layout.addWidget(line)
         layout.addWidget(self.view)
@@ -482,6 +637,48 @@ class MainWindow(QWidget):
         self.btnStart.setEnabled(not running)
         self.btnStop.setEnabled(running)
         self.btnScreenshot.setEnabled(running)
+        self.fpsSpin.setEnabled(not running)
+        self.bitrateInput.setEnabled(not running)
+        self.stayAwakeCheck.setEnabled(not running)
+        self.audioCheck.setEnabled(not running)
+
+    def _gather_launch_settings(self) -> Optional[Tuple[int, str, bool, bool]]:
+        bitrate = self._validated_bitrate()
+        if bitrate is None:
+            QMessageBox.warning(
+                self,
+                "scrcpy",
+                "Enter a bitrate like 16M, 8Mbit/s or 8000K.",
+            )
+            self.bitrateInput.setFocus()
+            self.bitrateInput.selectAll()
+            return None
+
+        return (
+            self.fpsSpin.value(),
+            bitrate,
+            self.stayAwakeCheck.isChecked(),
+            self.audioCheck.isChecked(),
+        )
+
+    def _validated_bitrate(self) -> Optional[str]:
+        text = self.bitrateInput.text().strip()
+        if not text:
+            return DEFAULT_BITRATE
+
+        if not BITRATE_PATTERN.fullmatch(text):
+            return None
+
+        suffix = ""
+        if text.lower().endswith("bit/s"):
+            text = text[:-5]
+            suffix = "bit/s"
+
+        normalized = text.strip().upper()
+        if not normalized:
+            return None
+
+        return f"{normalized}{suffix}" if suffix else normalized
 
     def _on_stream_started(self) -> None:
         self.status.setText(f"{self._device_label()} — STREAMING")
@@ -493,13 +690,26 @@ class MainWindow(QWidget):
         self._update_controls(running=False)
 
     def _on_start_clicked(self) -> None:
+        settings = self._gather_launch_settings()
+        if not settings:
+            return
+
+        fps, bitrate, stay_awake, audio = settings
         self.status.setText(f"{self._device_label()} — STARTING…")
-        self.ctrl.start()
+        self.ctrl.start(fps, bitrate, stay_awake=stay_awake, audio=audio)
 
     def _on_error(self, message: str) -> None:
         self.status.setText(f"{self._device_label()} — ERROR")
         QMessageBox.critical(self, "scrcpy", message)
         self._update_controls(running=False)
+
+    def _on_audio_unavailable(self, message: str) -> None:
+        was_blocked = self.audioCheck.blockSignals(True)
+        self.audioCheck.setChecked(False)
+        self.audioCheck.blockSignals(was_blocked)
+        if self.ctrl.is_running:
+            self.status.setText(f"{self._device_label()} — STREAMING (NO AUDIO)")
+        QMessageBox.warning(self, "scrcpy", message)
 
     def _resize_window_to_device(self) -> None:
         if not self.ctrl.resolution:
@@ -510,25 +720,55 @@ class MainWindow(QWidget):
             return
 
         available = screen.availableGeometry()
-        max_width = available.width() * 0.9
-        max_height = available.height() * 0.9
-
         device_w, device_h = self.ctrl.resolution
-        if not device_h:
+        if not device_w or not device_h:
             return
 
-        scale = min(max_width / device_w, max_height / device_h)
-        scale = max(scale, 0.25)
+        layout = self.layout()
+        if not layout:
+            return
 
-        target_w = int(device_w * scale)
-        target_h = int(device_h * scale)
+        def _item_height(index: int) -> int:
+            item = layout.itemAt(index)
+            if not item:
+                return 0
+            widget = item.widget()
+            if widget and widget.isVisible():
+                return widget.height()
+            hint = item.sizeHint()
+            return hint.height()
 
-        view_h = max(1, self.view.height())
-        view_w = max(1, self.view.width())
-        chrome_height = max(0, self.height() - view_h)
-        chrome_width = max(0, self.width() - view_w)
+        margins = layout.contentsMargins()
+        spacing_total = layout.spacing() * max(0, layout.count() - 1)
+        header_height = (
+            margins.top()
+            + margins.bottom()
+            + _item_height(0)
+            + _item_height(1)
+            + _item_height(2)
+            + spacing_total
+        )
+        horizontal_chrome = margins.left() + margins.right()
 
-        self.resize(target_w + chrome_width, target_h + chrome_height)
+        frame_extra_w = max(0, self.frameGeometry().width() - self.geometry().width())
+        frame_extra_h = max(0, self.frameGeometry().height() - self.geometry().height())
+
+        max_view_width = max(1, available.width() - horizontal_chrome - frame_extra_w)
+        max_view_height = max(1, available.height() - header_height - frame_extra_h)
+
+        scale = min(max_view_width / device_w, max_view_height / device_h)
+        if scale <= 0:
+            return
+
+        target_w = max(1, int(device_w * scale))
+        target_h = max(1, int(device_h * scale))
+
+        self.view.setMinimumSize(target_w, target_h)
+        self.view.resize(target_w, target_h)
+
+        total_width = target_w + horizontal_chrome + frame_extra_w
+        total_height = target_h + header_height + frame_extra_h
+        self.resize(total_width, total_height)
 
     def _capture_screenshot(self) -> None:
         screen = QApplication.primaryScreen()
@@ -556,7 +796,7 @@ class MainWindow(QWidget):
             return
 
         cropped = dialog.selected_pixmap()
-        default_name = "screenshot"
+        default_name = datetime.now().strftime("screenshot-%Y%m%d-%H%M%S")
         name, ok = QInputDialog.getText(
             self,
             "Save Screenshot",
