@@ -6,10 +6,11 @@ import sys
 import subprocess
 from typing import Optional
 
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QRect, QSize, QEvent
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QFrame, QMessageBox, QSizePolicy
+    QPushButton, QLabel, QFrame, QMessageBox, QSizePolicy,
+    QDialog, QDialogButtonBox, QInputDialog, QRubberBand
 )
 
 import win32con, win32gui
@@ -206,6 +207,56 @@ class AndroidView(QWidget):
             win32gui.MoveWindow(hwnd, x_off, y_off, width, height, True)
 
 
+class CropDialog(QDialog):
+    def __init__(self, pixmap, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Crop Screenshot")
+        self._pixmap = pixmap
+        self._selection = QRect()
+        self._origin = None
+
+        self.label = QLabel()
+        self.label.setPixmap(pixmap)
+        self.label.setFixedSize(pixmap.size())
+        self.label.installEventFilter(self)
+
+        self.rubber_band = QRubberBand(QRubberBand.Rectangle, self.label)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.label, alignment=Qt.AlignCenter)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.resize(pixmap.size())
+
+    def eventFilter(self, watched, event):
+        if watched is self.label:
+            if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                self._origin = event.pos()
+                self.rubber_band.setGeometry(QRect(self._origin, QSize()))
+                self.rubber_band.show()
+                return True
+            elif event.type() == QEvent.MouseMove and self._origin is not None:
+                rect = QRect(self._origin, event.pos()).normalized()
+                self.rubber_band.setGeometry(rect)
+                return True
+            elif event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+                rect = QRect(self._origin, event.pos()).normalized() if self._origin else QRect()
+                self._selection = rect
+                self._origin = None
+                self.rubber_band.hide()
+                return True
+        return super().eventFilter(watched, event)
+
+    def selected_pixmap(self):
+        if self._selection and self._selection.width() > 1 and self._selection.height() > 1:
+            return self._pixmap.copy(self._selection)
+        return self._pixmap
+
+
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
@@ -220,11 +271,13 @@ class MainWindow(QWidget):
 
         self.btnStart = QPushButton("Start Stream")
         self.btnStop = QPushButton("Stop")
+        self.btnScreenshot = QPushButton("Screenshot")
         self.status = QLabel(f"Device: {device or 'Not Found'}")
         self.status.setStyleSheet("color:#bbb;")
 
         self.btnStart.clicked.connect(lambda: self.ctrl.start())
         self.btnStop.clicked.connect(self.ctrl.stop)
+        self.btnScreenshot.clicked.connect(self._capture_screenshot)
         self.ctrl.started.connect(lambda: self.status.setText(f"Device: {device} — STREAMING"))
         self.ctrl.stopped.connect(lambda: self.status.setText(f"Device: {device} — STOPPED"))
         self.ctrl.error.connect(lambda m: QMessageBox.critical(self, "scrcpy", m))
@@ -232,6 +285,7 @@ class MainWindow(QWidget):
         top = QHBoxLayout()
         top.addWidget(self.btnStart)
         top.addWidget(self.btnStop)
+        top.addWidget(self.btnScreenshot)
         top.addStretch()
         top.addWidget(self.status)
 
@@ -277,6 +331,43 @@ class MainWindow(QWidget):
         chrome_width = max(0, self.width() - view_w)
 
         self.resize(target_w + chrome_width, target_h + chrome_height)
+
+    def _capture_screenshot(self):
+        screen = QApplication.primaryScreen()
+        if not screen:
+            QMessageBox.warning(self, "Screenshot", "No primary screen available.")
+            return
+
+        pixmap = screen.grabWindow(self.view.winId())
+        if pixmap.isNull():
+            QMessageBox.warning(self, "Screenshot", "Unable to capture screenshot.")
+            return
+
+        dialog = CropDialog(pixmap, self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        cropped = dialog.selected_pixmap()
+        name, ok = QInputDialog.getText(self, "Save Screenshot", "File name:", text="screenshot")
+        if not ok:
+            return
+
+        name = name.strip()
+        if not name:
+            QMessageBox.warning(self, "Screenshot", "File name cannot be empty.")
+            return
+
+        if not name.lower().endswith(".png"):
+            name += ".png"
+
+        os.makedirs("images", exist_ok=True)
+        path = os.path.join("images", name)
+
+        if not cropped.save(path, "PNG"):
+            QMessageBox.critical(self, "Screenshot", "Failed to save screenshot.")
+            return
+
+        QMessageBox.information(self, "Screenshot", f"Saved screenshot to:\n{os.path.abspath(path)}")
 
 
 def main():
