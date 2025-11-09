@@ -11,6 +11,7 @@ ShadowCastX-Touch is a lightweight PyQt5 application that embeds a [`scrcpy`](ht
 
 - Windows 10/11 with [ADB](https://developer.android.com/tools/adb) available on the `PATH`.
 - [`scrcpy` 3.x](https://github.com/Genymobile/scrcpy) installed locally. You can either place the binary on the `PATH` or point `SCRCPY_EXE` at the executable.
+- A scrcpy build compiled with audio forwarding support (v2.1 or newer) if you plan to enable host audio playback.
 - Python 3.9+ with the following packages installed:
   - `PyQt5`
   - `pywin32`
@@ -41,6 +42,7 @@ python script.py
 4. (Optional) Pick a specific device from the **Device** drop-down, then click **Refresh** if you plug in a new device while the app is running.
 5. Click **Start Stream** to launch the embedded scrcpy session.
 6. Use **Screenshot** to capture the current frame, optionally cropping before saving.
+7. Toggle **Enable audio** before starting the stream to forward device audio. The toggle is disabled automatically when your scrcpy build lacks `--audio` support.
 
 The application provides basic status messaging and automatically shuts down the scrcpy process when you close the window.
 

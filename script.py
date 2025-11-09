@@ -10,7 +10,7 @@ import sys
 import threading
 from dataclasses import dataclass
 from queue import Empty, SimpleQueue
-from typing import IO, List, Optional, Tuple
+from typing import IO, Dict, List, Optional, Tuple
 
 from datetime import datetime
 
@@ -47,6 +47,9 @@ DEFAULT_BITRATE = "16M"
 DEFAULT_SCREENSHOT_DIR = "images"
 
 BITRATE_PATTERN = re.compile(r"^\d+(?:\.\d+)?(?:[KMG](?:bit/s)?)?$", re.IGNORECASE)
+
+
+_SCRCPY_AUDIO_SUPPORT_CACHE: Dict[str, bool] = {}
 
 
 @dataclass(frozen=True)
@@ -156,7 +159,9 @@ class ScrcpyLaunchOptions:
         ]
         if self.stay_awake:
             args.append("--stay-awake")
-        if not self.audio:
+        if self.audio:
+            args.append("--audio")
+        else:
             args.append("--no-audio")
         return args
 
@@ -186,6 +191,27 @@ def _resolve_scrcpy() -> Optional[str]:
     from shutil import which
 
     return which("scrcpy")
+
+
+def _scrcpy_supports_audio(executable: str) -> bool:
+    """Return ``True`` if the scrcpy binary advertises the ``--audio`` flag."""
+
+    cached = _SCRCPY_AUDIO_SUPPORT_CACHE.get(executable)
+    if cached is not None:
+        return cached
+
+    try:
+        help_output = subprocess.check_output(
+            [executable, "--help"], stderr=subprocess.STDOUT
+        ).decode("utf-8", "ignore")
+    except Exception as exc:  # noqa: BLE001 - detection errors vary by install
+        logger.debug("Unable to determine scrcpy audio support: %s", exc)
+        _SCRCPY_AUDIO_SUPPORT_CACHE[executable] = False
+        return False
+
+    supports_audio = bool(re.search(r"\n\s*--audio(?:[ =]|$)", help_output))
+    _SCRCPY_AUDIO_SUPPORT_CACHE[executable] = supports_audio
+    return supports_audio
 
 
 def list_connected_devices() -> List[DeviceInfo]:
@@ -286,6 +312,16 @@ class ScrcpyController(QObject):
             self.error.emit("scrcpy.exe not found. Set SCRCPY_EXE to full path.")
             return
 
+        requested_audio = audio
+        audio_support_warning: Optional[str] = None
+        if audio and not _scrcpy_supports_audio(exe):
+            audio = False
+            logger.info("scrcpy binary at %s does not advertise --audio; disabling host audio.", exe)
+            audio_support_warning = (
+                "The configured scrcpy binary does not support audio forwarding. "
+                "Streaming will continue without audio."
+            )
+
         try:
             options = ScrcpyLaunchOptions(
                 max_fps=fps,
@@ -299,7 +335,7 @@ class ScrcpyController(QObject):
 
         self._update_resolution()
 
-        self._audio_requested = audio
+        self._audio_requested = requested_audio
         self._audio_warning_emitted = False
         self._stderr_queue = SimpleQueue()
         self._stderr_thread = None
@@ -323,6 +359,10 @@ class ScrcpyController(QObject):
             logger.error("Failed to start scrcpy: %s", exc)
             self.error.emit(str(exc))
             return
+
+        if audio_support_warning:
+            self._audio_warning_emitted = True
+            self.audio_unavailable.emit(audio_support_warning)
 
         if self.proc and self.proc.stderr:
             self._start_output_reader(self.proc.stderr)
@@ -714,6 +754,13 @@ class MainWindow(QWidget):
         self.audioCheck = QCheckBox("Enable audio")
         self.audioCheck.setToolTip("Capture audio in addition to video when supported.")
         self.audioCheck.setChecked(False)
+        self._audio_tooltip = self.audioCheck.toolTip()
+        self.audioSupportLabel = QLabel("")
+        self.audioSupportLabel.setProperty("colorRole", "muted")
+        self.audioSupportLabel.setVisible(False)
+        self.audioSupportLabel.setWordWrap(True)
+        self.audioSupportLabel.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._audio_supported: Optional[bool] = None
 
         self.btnStart = QPushButton("Start Stream")
         self.btnStop = QPushButton("Stop")
@@ -730,6 +777,8 @@ class MainWindow(QWidget):
         self.ctrl.stopped.connect(self._on_stream_stopped)
         self.ctrl.error.connect(self._on_error)
         self.ctrl.audio_unavailable.connect(self._on_audio_unavailable)
+
+        self._update_audio_support_indicator()
 
         config_bar = QWidget()
         config_layout = QHBoxLayout(config_bar)
@@ -756,6 +805,7 @@ class MainWindow(QWidget):
         config_layout.addSpacing(10)
         config_layout.addWidget(self.stayAwakeCheck)
         config_layout.addWidget(self.audioCheck)
+        config_layout.addWidget(self.audioSupportLabel)
         config_layout.addStretch(1)
 
         top = QHBoxLayout()
@@ -793,6 +843,41 @@ class MainWindow(QWidget):
             return f"Device: {current_text}"
         return "Device: Not Found"
 
+    def _update_audio_support_indicator(self) -> None:
+        exe = _resolve_scrcpy()
+        tooltip = self._audio_tooltip
+        label_text = ""
+        supported: Optional[bool]
+        if not exe:
+            supported = None
+            label_text = "Set SCRCPY_EXE to a scrcpy 2.1+ build to enable audio."
+            tooltip = (
+                "Audio forwarding requires scrcpy 2.1 or newer, but no scrcpy "
+                "executable could be located."
+            )
+        else:
+            if _scrcpy_supports_audio(exe):
+                supported = True
+            else:
+                supported = False
+                label_text = "Audio unsupported by this scrcpy build."
+                tooltip = (
+                    "Audio forwarding is disabled because the configured scrcpy "
+                    "binary does not support the --audio flag. Upgrade to scrcpy "
+                    "2.1 or newer."
+                )
+
+        self._audio_supported = supported
+        self.audioSupportLabel.setText(label_text)
+        self.audioSupportLabel.setVisible(bool(label_text))
+        self.audioCheck.setToolTip(tooltip)
+        if supported is not True:
+            was_blocked = self.audioCheck.blockSignals(True)
+            self.audioCheck.setChecked(False)
+            self.audioCheck.blockSignals(was_blocked)
+
+        self._update_controls(running=self.ctrl.is_running)
+
     def _update_controls(self, running: bool) -> None:
         has_device = self._selected_serial() is not None
         self.btnStart.setEnabled(not running and has_device)
@@ -801,7 +886,8 @@ class MainWindow(QWidget):
         self.fpsSpin.setEnabled(not running)
         self.bitrateInput.setEnabled(not running)
         self.stayAwakeCheck.setEnabled(not running)
-        self.audioCheck.setEnabled(not running)
+        allow_audio = not running and self._audio_supported is True
+        self.audioCheck.setEnabled(allow_audio)
         self.deviceCombo.setEnabled(not running)
         self.refreshDevicesButton.setEnabled(not running)
 
@@ -821,7 +907,7 @@ class MainWindow(QWidget):
             self.fpsSpin.value(),
             bitrate,
             self.stayAwakeCheck.isChecked(),
-            self.audioCheck.isChecked(),
+            self.audioCheck.isChecked() and self._audio_supported is True,
         )
 
     def _toggle_theme(self) -> None:
