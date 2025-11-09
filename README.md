@@ -38,8 +38,9 @@ The application can be configured through module-level constants in `script.py` 
 python script.py
 ```
 
-4. Click **Start Stream** to launch the embedded scrcpy session.
-5. Use **Screenshot** to capture the current frame, optionally cropping before saving.
+4. Use the **Device** dropdown (and **Refresh** if needed) to pick which connected device to stream.
+5. Click **Start Stream** to launch the embedded scrcpy session.
+6. Use **Screenshot** to capture the current frame, optionally cropping before saving.
 
 The application provides basic status messaging and automatically shuts down the scrcpy process when you close the window.
 
