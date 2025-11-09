@@ -211,26 +211,64 @@ class CropDialog(QDialog):
     def __init__(self, pixmap, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Crop Screenshot")
+        self.setWindowFlag(Qt.FramelessWindowHint, True)
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        self.setModal(True)
+        self.setWindowState(Qt.WindowFullScreen)
+        self.setStyleSheet("background-color: rgba(10, 10, 10, 220);")
+
         self._pixmap = pixmap
         self._selection = QRect()
         self._origin = None
 
+        screen = QApplication.primaryScreen()
+        target_size = screen.size() if screen else pixmap.size()
+        self._scaled_pixmap = pixmap.scaled(
+            target_size,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        self._scale_x = pixmap.width() / max(1, self._scaled_pixmap.width())
+        self._scale_y = pixmap.height() / max(1, self._scaled_pixmap.height())
+
         self.label = QLabel()
-        self.label.setPixmap(pixmap)
-        self.label.setFixedSize(pixmap.size())
+        self.label.setPixmap(self._scaled_pixmap)
+        self.label.setFixedSize(self._scaled_pixmap.size())
+        self.label.setCursor(Qt.CrossCursor)
         self.label.installEventFilter(self)
 
         self.rubber_band = QRubberBand(QRubberBand.Rectangle, self.label)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(30, 30, 30, 30)
+        layout.setSpacing(20)
+        layout.addStretch(1)
         layout.addWidget(self.label, alignment=Qt.AlignCenter)
 
+        info_bar = QWidget()
+        info_layout = QHBoxLayout(info_bar)
+        info_layout.setContentsMargins(20, 12, 20, 12)
+        info_layout.setSpacing(15)
+        info_bar.setStyleSheet("background-color: rgba(0, 0, 0, 180);")
+
+        instructions = QLabel("Click and drag to choose the crop. Press Esc to cancel.")
+        instructions.setStyleSheet("color: #f0f0f0; font-size: 14px;")
+
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        ok_button = buttons.button(QDialogButtonBox.Ok)
+        if ok_button:
+            ok_button.setText("Save Selection")
+        cancel_button = buttons.button(QDialogButtonBox.Cancel)
+        if cancel_button:
+            cancel_button.setText("Cancel")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
 
-        self.resize(pixmap.size())
+        info_layout.addWidget(instructions)
+        info_layout.addStretch(1)
+        info_layout.addWidget(buttons)
+
+        layout.addWidget(info_bar)
 
     def eventFilter(self, watched, event):
         if watched is self.label:
@@ -247,14 +285,36 @@ class CropDialog(QDialog):
                 rect = QRect(self._origin, event.pos()).normalized() if self._origin else QRect()
                 self._selection = rect
                 self._origin = None
-                self.rubber_band.hide()
                 return True
         return super().eventFilter(watched, event)
 
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Escape, Qt.Key_Q):
+            self.reject()
+            return
+        super().keyPressEvent(event)
+
+    def accept(self):
+        if not self._selection or self._selection.width() < 2 or self._selection.height() < 2:
+            QMessageBox.warning(self, "Crop Screenshot", "Drag on the image to pick an area to save.")
+            return
+        super().accept()
+
     def selected_pixmap(self):
-        if self._selection and self._selection.width() > 1 and self._selection.height() > 1:
-            return self._pixmap.copy(self._selection)
-        return self._pixmap
+        rect = self._selection
+        if not rect or rect.width() < 1 or rect.height() < 1:
+            return self._pixmap
+
+        mapped = QRect(
+            int(rect.left() * self._scale_x),
+            int(rect.top() * self._scale_y),
+            int(rect.width() * self._scale_x),
+            int(rect.height() * self._scale_y),
+        )
+        mapped = mapped.intersected(QRect(0, 0, self._pixmap.width(), self._pixmap.height()))
+        if mapped.isNull():
+            return self._pixmap
+        return self._pixmap.copy(mapped)
 
 
 class MainWindow(QWidget):
@@ -342,6 +402,16 @@ class MainWindow(QWidget):
         if pixmap.isNull():
             QMessageBox.warning(self, "Screenshot", "Unable to capture screenshot.")
             return
+
+        if self.ctrl.resolution:
+            device_w, device_h = self.ctrl.resolution
+            if device_w and device_h:
+                pixmap = pixmap.scaled(
+                    device_w,
+                    device_h,
+                    Qt.IgnoreAspectRatio,
+                    Qt.SmoothTransformation,
+                )
 
         dialog = CropDialog(pixmap, self)
         if dialog.exec_() != QDialog.Accepted:
