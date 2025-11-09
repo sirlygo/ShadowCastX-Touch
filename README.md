@@ -27,6 +27,7 @@ The application can be configured through module-level constants in `script.py` 
 - `DEVICE_SERIAL` – Optional Android device serial to bind to on startup. When omitted the first available device is used.
 - `DEFAULT_MAX_FPS` / `DEFAULT_BITRATE` – Default stream quality values.
 - `DEFAULT_SCREENSHOT_DIR` – Destination folder for saved screenshots.
+- `SCRCPY_AUDIO_OUTPUT` – Optional override for the scrcpy `--audio-output` value. Defaults to `win32` on Windows and disabled elsewhere.
 
 ## Usage
 
