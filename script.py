@@ -9,7 +9,7 @@ from typing import Optional
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QFrame, QMessageBox
+    QPushButton, QLabel, QFrame, QMessageBox, QSizePolicy
 )
 
 import win32con, win32gui
@@ -54,6 +54,7 @@ class ScrcpyController(QObject):
         self.serial = serial
         self.proc = None
         self.hwnd = None
+        self.resolution = None
         self.poll = QTimer()
         self.poll.setInterval(250)
         self.poll.timeout.connect(self._find_window)
@@ -63,6 +64,8 @@ class ScrcpyController(QObject):
         if not exe:
             self.error.emit("scrcpy.exe not found. Set SCRCPY_EXE to full path.")
             return
+
+        self._update_resolution()
 
         args = [
             exe,
@@ -101,6 +104,32 @@ class ScrcpyController(QObject):
             self.poll.stop()
             self.started.emit()
 
+    def _update_resolution(self):
+        try:
+            cmd = ["adb"]
+            if self.serial:
+                cmd += ["-s", self.serial]
+            cmd += ["shell", "wm", "size"]
+            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode("utf-8", "ignore")
+            for line in out.splitlines():
+                if "Physical size:" in line:
+                    size = line.split(":", 1)[1].strip()
+                    break
+                if "Override size:" in line:
+                    size = line.split(":", 1)[1].strip()
+                    break
+            else:
+                size = None
+            if size:
+                size = size.split()[0]
+                if "x" in size:
+                    w, h = size.split("x", 1)
+                    self.resolution = (int(w), int(h))
+                    return
+        except Exception:
+            pass
+        self.resolution = None
+
 
 class AndroidView(QWidget):
     def __init__(self, controller: ScrcpyController):
@@ -119,8 +148,20 @@ class AndroidView(QWidget):
         if not hwnd: return
         win32gui.SetParent(hwnd, int(self.winId()))
         style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
-        style &= ~(win32con.WS_CAPTION|win32con.WS_THICKFRAME|win32con.WS_MINIMIZEBOX|win32con.WS_MAXIMIZEBOX|win32con.WS_SYSMENU)
+        style &= ~(win32con.WS_CAPTION | win32con.WS_THICKFRAME |
+                   win32con.WS_MINIMIZEBOX | win32con.WS_MAXIMIZEBOX |
+                   win32con.WS_SYSMENU)
+        style |= win32con.WS_CHILD | win32con.WS_VISIBLE
         win32gui.SetWindowLong(hwnd, win32con.GWL_STYLE, style)
+        win32gui.SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            win32con.SWP_NOSIZE | win32con.SWP_NOMOVE | win32con.SWP_NOZORDER | win32con.SWP_FRAMECHANGED,
+        )
         self._resize_child()
 
     def resizeEvent(self, e):
@@ -131,19 +172,51 @@ class AndroidView(QWidget):
         hwnd = self.controller.hwnd
         if hwnd:
             r = self.rect()
-            win32gui.MoveWindow(hwnd, 0, 0, r.width(), r.height(), True)
+            width, height = r.width(), r.height()
+            x_off = 0
+            y_off = 0
+
+            aspect = None
+            if self.controller.resolution and self.controller.resolution[1]:
+                aspect = self.controller.resolution[0] / self.controller.resolution[1]
+            else:
+                try:
+                    left, top, right, bottom = win32gui.GetClientRect(hwnd)
+                    if bottom - top:
+                        aspect = (right - left) / (bottom - top)
+                except Exception:
+                    aspect = None
+
+            if aspect and height:
+                available_aspect = width / height if height else aspect
+
+                target_width = width
+                target_height = height
+                if available_aspect > aspect:
+                    target_height = height
+                    target_width = max(1, int(round(target_height * aspect)))
+                else:
+                    target_width = width
+                    target_height = max(1, int(round(target_width / aspect)))
+
+                x_off = (width - target_width) // 2
+                y_off = (height - target_height) // 2
+                width, height = target_width, target_height
+
+            win32gui.MoveWindow(hwnd, x_off, y_off, width, height, True)
 
 
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Android — Embedded scrcpy")
-        self.resize(1100, 640)
+        self.resize(1400, 840)
 
         device = DEVICE_SERIAL or get_first_device()
 
         self.ctrl = ScrcpyController(device)
         self.view = AndroidView(self.ctrl)
+        self.view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         self.btnStart = QPushButton("Start Stream")
         self.btnStop = QPushButton("Stop")
@@ -167,9 +240,43 @@ class MainWindow(QWidget):
         line.setStyleSheet("color:#333;")
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(6)
         layout.addLayout(top)
         layout.addWidget(line)
         layout.addWidget(self.view)
+        layout.setStretch(2, 1)
+
+        self.ctrl.started.connect(self._on_stream_started)
+
+    def _on_stream_started(self):
+        if not self.ctrl.resolution:
+            return
+
+        screen = QApplication.primaryScreen()
+        if not screen:
+            return
+
+        available = screen.availableGeometry()
+        max_width = available.width() * 0.9
+        max_height = available.height() * 0.9
+
+        device_w, device_h = self.ctrl.resolution
+        if not device_h:
+            return
+
+        scale = min(max_width / device_w, max_height / device_h)
+        scale = max(scale, 0.25)
+
+        target_w = int(device_w * scale)
+        target_h = int(device_h * scale)
+
+        view_h = max(1, self.view.height())
+        view_w = max(1, self.view.width())
+        chrome_height = max(0, self.height() - view_h)
+        chrome_width = max(0, self.width() - view_w)
+
+        self.resize(target_w + chrome_width, target_h + chrome_height)
 
 
 def main():
