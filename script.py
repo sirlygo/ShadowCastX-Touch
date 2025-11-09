@@ -47,6 +47,83 @@ DEFAULT_BITRATE = "16M"
 DEFAULT_SCREENSHOT_DIR = "images"
 
 BITRATE_PATTERN = re.compile(r"^\d+(?:\.\d+)?(?:[KMG](?:bit/s)?)?$", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class ThemePalette:
+    """Collection of colors used to render the UI for a specific theme."""
+
+    name: str
+    window_bg: str
+    panel_bg: str
+    text_color: str
+    muted_text: str
+    status_text: str
+    button_bg: str
+    button_hover_bg: str
+    button_pressed_bg: str
+    button_border: str
+    input_bg: str
+    input_border: str
+    disabled_bg: str
+    disabled_text: str
+    disabled_border: str
+    divider: str
+    accent: str
+    android_bg: str
+    overlay_scrim: str
+    overlay_panel: str
+    overlay_text: str
+
+
+DARK_THEME = ThemePalette(
+    name="dark",
+    window_bg="#121212",
+    panel_bg="#1e1e1e",
+    text_color="#f3f3f3",
+    muted_text="#bbbbbb",
+    status_text="#e6e6e6",
+    button_bg="#2a2a2a",
+    button_hover_bg="#353535",
+    button_pressed_bg="#2a2a2a",
+    button_border="#3d3d3d",
+    input_bg="#1c1c1c",
+    input_border="#3d3d3d",
+    disabled_bg="#181818",
+    disabled_text="#7a7a7a",
+    disabled_border="#2b2b2b",
+    divider="#2f2f2f",
+    accent="#377dff",
+    android_bg="#000000",
+    overlay_scrim="rgba(10, 10, 10, 220)",
+    overlay_panel="rgba(0, 0, 0, 180)",
+    overlay_text="#f0f0f0",
+)
+
+
+LIGHT_THEME = ThemePalette(
+    name="light",
+    window_bg="#f4f4f4",
+    panel_bg="#ffffff",
+    text_color="#1a1a1a",
+    muted_text="#555555",
+    status_text="#2d2d2d",
+    button_bg="#ffffff",
+    button_hover_bg="#eaeaea",
+    button_pressed_bg="#dcdcdc",
+    button_border="#c9c9c9",
+    input_bg="#ffffff",
+    input_border="#c9c9c9",
+    disabled_bg="#f0f0f0",
+    disabled_text="#9a9a9a",
+    disabled_border="#d5d5d5",
+    divider="#d1d1d1",
+    accent="#0d6efd",
+    android_bg="#f9f9f9",
+    overlay_scrim="rgba(245, 245, 245, 220)",
+    overlay_panel="rgba(255, 255, 255, 230)",
+    overlay_text="#1a1a1a",
+)
 # ====================
 
 
@@ -384,12 +461,24 @@ class AndroidView(QWidget):
         super().__init__()
         self.controller = controller
         self.setAttribute(Qt.WA_NativeWindow, True)
-        self.setStyleSheet("background:#000;")
+        self._background = DARK_THEME.android_bg
+        self._apply_background()
         controller.started.connect(self._embed)
         self.r_timer = QTimer(self)
         self.r_timer.setInterval(1000)
         self.r_timer.timeout.connect(self._resize_child)
         self.r_timer.start()
+
+    def set_background_color(self, color: str) -> None:
+        """Update the placeholder background behind the embedded window."""
+
+        if self._background == color:
+            return
+        self._background = color
+        self._apply_background()
+
+    def _apply_background(self) -> None:
+        self.setStyleSheet(f"background:{self._background};")
 
     def _embed(self) -> None:
         hwnd = self.controller.hwnd
@@ -458,14 +547,14 @@ class AndroidView(QWidget):
 class CropDialog(QDialog):
     """Full screen dialog allowing the user to crop a screenshot."""
 
-    def __init__(self, pixmap, parent=None):
+    def __init__(self, pixmap, parent=None, theme: Optional[ThemePalette] = None):
         super().__init__(parent)
         self.setWindowTitle("Crop Screenshot")
         self.setWindowFlag(Qt.FramelessWindowHint, True)
         self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
         self.setModal(True)
         self.setWindowState(Qt.WindowFullScreen)
-        self.setStyleSheet("background-color: rgba(10, 10, 10, 220);")
+        self._theme = theme or DARK_THEME
 
         self._pixmap = pixmap
         self._selection = QRect()
@@ -499,10 +588,10 @@ class CropDialog(QDialog):
         info_layout = QHBoxLayout(info_bar)
         info_layout.setContentsMargins(20, 12, 20, 12)
         info_layout.setSpacing(15)
-        info_bar.setStyleSheet("background-color: rgba(0, 0, 0, 180);")
+        self._info_bar = info_bar
 
         instructions = QLabel("Click and drag to choose the crop. Press Esc to cancel.")
-        instructions.setStyleSheet("color: #f0f0f0; font-size: 14px;")
+        self._instructions = instructions
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         ok_button = buttons.button(QDialogButtonBox.Ok)
@@ -519,6 +608,17 @@ class CropDialog(QDialog):
         info_layout.addWidget(buttons)
 
         layout.addWidget(info_bar)
+        self._apply_theme()
+
+    def _apply_theme(self) -> None:
+        theme = self._theme
+        self.setStyleSheet(f"background-color: {theme.overlay_scrim};")
+        self._info_bar.setStyleSheet(
+            f"background-color: {theme.overlay_panel}; border-radius: 10px;"
+        )
+        self._instructions.setStyleSheet(
+            f"color: {theme.overlay_text}; font-size: 14px;"
+        )
 
     def eventFilter(self, watched, event):  # noqa: N802 (Qt API)
         if watched is self.label:
@@ -618,8 +718,10 @@ class MainWindow(QWidget):
         self.btnStart = QPushButton("Start Stream")
         self.btnStop = QPushButton("Stop")
         self.btnScreenshot = QPushButton("Screenshot")
+        self.themeToggle = QPushButton("Switch to Light Mode")
+        self.themeToggle.clicked.connect(self._toggle_theme)
         self.status = QLabel(self._device_label())
-        self.status.setStyleSheet("color:#bbb;")
+        self.status.setObjectName("StatusLabel")
 
         self.btnStart.clicked.connect(self._on_start_clicked)
         self.btnStop.clicked.connect(self.ctrl.stop)
@@ -635,19 +737,19 @@ class MainWindow(QWidget):
         config_layout.setSpacing(12)
 
         device_label = QLabel("Device:")
-        device_label.setStyleSheet("color:#bbb;")
+        device_label.setProperty("colorRole", "muted")
         config_layout.addWidget(device_label)
         config_layout.addWidget(self.deviceCombo)
         config_layout.addWidget(self.refreshDevicesButton)
         config_layout.addSpacing(10)
 
         fps_label = QLabel("Max FPS:")
-        fps_label.setStyleSheet("color:#bbb;")
+        fps_label.setProperty("colorRole", "muted")
         config_layout.addWidget(fps_label)
         config_layout.addWidget(self.fpsSpin)
 
         bitrate_label = QLabel("Bitrate:")
-        bitrate_label.setStyleSheet("color:#bbb;")
+        bitrate_label.setProperty("colorRole", "muted")
         config_layout.addWidget(bitrate_label)
         config_layout.addWidget(self.bitrateInput)
 
@@ -660,12 +762,13 @@ class MainWindow(QWidget):
         top.addWidget(self.btnStart)
         top.addWidget(self.btnStop)
         top.addWidget(self.btnScreenshot)
+        top.addWidget(self.themeToggle)
         top.addStretch()
         top.addWidget(self.status)
 
         line = QFrame()
         line.setFrameShape(QFrame.HLine)
-        line.setStyleSheet("color:#333;")
+        line.setObjectName("Divider")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
@@ -676,6 +779,10 @@ class MainWindow(QWidget):
         layout.addWidget(self.view)
         layout.setStretch(2, 1)
 
+        config_bar.setObjectName("ConfigBar")
+
+        self._theme = DARK_THEME
+        self._apply_theme()
         self._refresh_devices()
 
     def _device_label(self) -> str:
@@ -716,6 +823,99 @@ class MainWindow(QWidget):
             self.stayAwakeCheck.isChecked(),
             self.audioCheck.isChecked(),
         )
+
+    def _toggle_theme(self) -> None:
+        self._theme = LIGHT_THEME if self._theme.name == "dark" else DARK_THEME
+        self._apply_theme()
+
+    def _apply_theme(self) -> None:
+        theme = self._theme
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(
+                f"""
+                QWidget {{
+                    background-color: {theme.window_bg};
+                    color: {theme.text_color};
+                }}
+                QWidget#ConfigBar {{
+                    background-color: {theme.panel_bg};
+                    border: 1px solid {theme.input_border};
+                    border-radius: 8px;
+                }}
+                QLabel[colorRole='muted'] {{
+                    color: {theme.muted_text};
+                }}
+                QLabel#StatusLabel {{
+                    color: {theme.status_text};
+                }}
+                QFrame#Divider {{
+                    background-color: {theme.divider};
+                    min-height: 1px;
+                    max-height: 1px;
+                }}
+                QPushButton {{
+                    background-color: {theme.button_bg};
+                    color: {theme.text_color};
+                    border: 1px solid {theme.button_border};
+                    border-radius: 6px;
+                    padding: 6px 12px;
+                }}
+                QPushButton:hover {{
+                    background-color: {theme.button_hover_bg};
+                }}
+                QPushButton:pressed {{
+                    background-color: {theme.button_pressed_bg};
+                }}
+                QPushButton:disabled {{
+                    background-color: {theme.disabled_bg};
+                    color: {theme.disabled_text};
+                    border: 1px solid {theme.disabled_border};
+                }}
+                QLineEdit, QSpinBox, QComboBox {{
+                    background-color: {theme.input_bg};
+                    color: {theme.text_color};
+                    border: 1px solid {theme.input_border};
+                    border-radius: 4px;
+                    padding: 4px 6px;
+                }}
+                QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled {{
+                    color: {theme.disabled_text};
+                    background-color: {theme.disabled_bg};
+                    border: 1px solid {theme.disabled_border};
+                }}
+                QComboBox QAbstractItemView {{
+                    background-color: {theme.input_bg};
+                    color: {theme.text_color};
+                    selection-background-color: {theme.accent};
+                }}
+                QCheckBox {{
+                    spacing: 6px;
+                }}
+                QCheckBox::indicator {{
+                    width: 16px;
+                    height: 16px;
+                }}
+                QCheckBox::indicator:unchecked {{
+                    border: 1px solid {theme.input_border};
+                    background-color: {theme.input_bg};
+                }}
+                QCheckBox::indicator:checked {{
+                    border: 1px solid {theme.accent};
+                    background-color: {theme.accent};
+                }}
+                QToolTip {{
+                    background-color: {theme.panel_bg};
+                    color: {theme.text_color};
+                    border: 1px solid {theme.input_border};
+                }}
+                """
+            )
+
+        next_mode = "Light" if theme.name == "dark" else "Dark"
+        self.themeToggle.setText(f"Switch to {next_mode} Mode")
+        self.themeToggle.setToolTip(f"Enable the {next_mode.lower()} theme.")
+        self.view.set_background_color(theme.android_bg)
 
     def _validated_bitrate(self) -> Optional[str]:
         text = self.bitrateInput.text().strip()
@@ -941,7 +1141,7 @@ class MainWindow(QWidget):
                     Qt.SmoothTransformation,
                 )
 
-        dialog = CropDialog(pixmap, self)
+        dialog = CropDialog(pixmap, self, theme=self._theme)
         if dialog.exec_() != QDialog.Accepted:
             return
 
