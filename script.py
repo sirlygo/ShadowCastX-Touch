@@ -15,6 +15,7 @@ from typing import IO, List, Optional, Tuple
 from datetime import datetime
 
 from PyQt5.QtCore import QEvent, QRect, QSize, Qt, QTimer, QObject, pyqtSignal
+from PyQt5.QtGui import QColor, QPalette
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -575,6 +576,8 @@ class MainWindow(QWidget):
         self.setWindowTitle("Android — Embedded scrcpy")
         self.resize(1400, 840)
 
+        self._dark_mode = True
+
         device = DEVICE_SERIAL or get_first_device()
 
         self.ctrl = ScrcpyController(device)
@@ -619,7 +622,6 @@ class MainWindow(QWidget):
         self.btnStop = QPushButton("Stop")
         self.btnScreenshot = QPushButton("Screenshot")
         self.status = QLabel(self._device_label())
-        self.status.setStyleSheet("color:#bbb;")
 
         self.btnStart.clicked.connect(self._on_start_clicked)
         self.btnStop.clicked.connect(self.ctrl.stop)
@@ -634,21 +636,18 @@ class MainWindow(QWidget):
         config_layout.setContentsMargins(0, 0, 0, 0)
         config_layout.setSpacing(12)
 
-        device_label = QLabel("Device:")
-        device_label.setStyleSheet("color:#bbb;")
-        config_layout.addWidget(device_label)
+        self.deviceLabel = QLabel("Device:")
+        config_layout.addWidget(self.deviceLabel)
         config_layout.addWidget(self.deviceCombo)
         config_layout.addWidget(self.refreshDevicesButton)
         config_layout.addSpacing(10)
 
-        fps_label = QLabel("Max FPS:")
-        fps_label.setStyleSheet("color:#bbb;")
-        config_layout.addWidget(fps_label)
+        self.fpsLabel = QLabel("Max FPS:")
+        config_layout.addWidget(self.fpsLabel)
         config_layout.addWidget(self.fpsSpin)
 
-        bitrate_label = QLabel("Bitrate:")
-        bitrate_label.setStyleSheet("color:#bbb;")
-        config_layout.addWidget(bitrate_label)
+        self.bitrateLabel = QLabel("Bitrate:")
+        config_layout.addWidget(self.bitrateLabel)
         config_layout.addWidget(self.bitrateInput)
 
         config_layout.addSpacing(10)
@@ -656,26 +655,35 @@ class MainWindow(QWidget):
         config_layout.addWidget(self.audioCheck)
         config_layout.addStretch(1)
 
+        self.themeToggle = QCheckBox("Dark mode")
+        self.themeToggle.setChecked(True)
+        self.themeToggle.setToolTip("Toggle between dark and light themes.")
+        self.themeToggle.stateChanged.connect(self._on_theme_changed)
+
         top = QHBoxLayout()
         top.addWidget(self.btnStart)
         top.addWidget(self.btnStop)
         top.addWidget(self.btnScreenshot)
+        top.addWidget(self.themeToggle)
         top.addStretch()
         top.addWidget(self.status)
 
-        line = QFrame()
-        line.setFrameShape(QFrame.HLine)
-        line.setStyleSheet("color:#333;")
+        self.separator = QFrame()
+        self.separator.setFrameShape(QFrame.HLine)
+        self.separator.setFrameShadow(QFrame.Plain)
+        self.separator.setFixedHeight(1)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(6)
         layout.addWidget(config_bar)
         layout.addLayout(top)
-        layout.addWidget(line)
+        layout.addWidget(self.separator)
         layout.addWidget(self.view)
         layout.setStretch(2, 1)
 
+        self._theme_labels = [self.deviceLabel, self.fpsLabel, self.bitrateLabel]
+        self._apply_theme(self._dark_mode)
         self._refresh_devices()
 
     def _device_label(self) -> str:
@@ -697,6 +705,60 @@ class MainWindow(QWidget):
         self.audioCheck.setEnabled(not running)
         self.deviceCombo.setEnabled(not running)
         self.refreshDevicesButton.setEnabled(not running)
+
+    def _on_theme_changed(self, state: int) -> None:
+        dark = state == Qt.Checked
+        self._dark_mode = dark
+        self._apply_theme(dark)
+
+    def _apply_theme(self, dark: bool) -> None:
+        app = QApplication.instance()
+        if not app:
+            return
+
+        if dark:
+            app.setPalette(self._dark_palette())
+        else:
+            app.setPalette(app.style().standardPalette())
+
+        self._update_theme_styles(dark)
+
+    def _dark_palette(self) -> QPalette:
+        palette = QPalette()
+        palette.setColor(QPalette.Window, QColor(18, 18, 18))
+        palette.setColor(QPalette.WindowText, QColor(240, 240, 240))
+        palette.setColor(QPalette.Base, QColor(24, 24, 24))
+        palette.setColor(QPalette.AlternateBase, QColor(34, 34, 34))
+        palette.setColor(QPalette.ToolTipBase, QColor(255, 255, 255))
+        palette.setColor(QPalette.ToolTipText, QColor(0, 0, 0))
+        palette.setColor(QPalette.Text, QColor(220, 220, 220))
+        palette.setColor(QPalette.Button, QColor(34, 34, 34))
+        palette.setColor(QPalette.ButtonText, QColor(240, 240, 240))
+        palette.setColor(QPalette.BrightText, QColor(255, 0, 0))
+        palette.setColor(QPalette.Highlight, QColor(68, 114, 196))
+        palette.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
+        palette.setColor(QPalette.Disabled, QPalette.Text, QColor(120, 120, 120))
+        palette.setColor(QPalette.Disabled, QPalette.ButtonText, QColor(120, 120, 120))
+        return palette
+
+    def _update_theme_styles(self, dark: bool) -> None:
+        secondary = "#bbbbbb" if dark else "#404040"
+        primary = "#f0f0f0" if dark else "#202020"
+        separator = "#333333" if dark else "#d0d0d0"
+
+        for label in self._theme_labels:
+            label.setStyleSheet(f"color:{secondary};")
+
+        self.status.setStyleSheet(f"color:{primary};")
+        self.separator.setStyleSheet(
+            f"background-color:{separator}; border:none; min-height:1px;"
+        )
+
+        title = "Dark mode" if dark else "Light mode"
+        block = self.themeToggle.blockSignals(True)
+        self.themeToggle.setText(title)
+        self.themeToggle.setChecked(dark)
+        self.themeToggle.blockSignals(block)
 
     def _gather_launch_settings(self) -> Optional[Tuple[int, str, bool, bool]]:
         bitrate = self._validated_bitrate()
