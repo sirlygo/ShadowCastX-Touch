@@ -1,51 +1,119 @@
-# script.py — Embedded scrcpy window inside PyQt5 (Windows)
-# Works with scrcpy 3.x (uses --video-bit-rate and --window-borderless)
+"""PyQt5 application that embeds a scrcpy window for touch interaction."""
 
+from __future__ import annotations
+
+import logging
 import os
-import sys
+import re
 import subprocess
-from typing import Optional
+import sys
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QRect, QSize, QEvent
+from PyQt5.QtCore import QEvent, QRect, QSize, Qt, QTimer, QObject, pyqtSignal
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QFrame, QMessageBox, QSizePolicy,
-    QDialog, QDialogButtonBox, QInputDialog, QRubberBand
+    QApplication,
+    QDialog,
+    QDialogButtonBox,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QMessageBox,
+    QPushButton,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+    QInputDialog,
+    QRubberBand,
 )
 
-import win32con, win32gui
+import win32con
+import win32gui
 
 # ====== CONFIG ======
-SCRCPY_EXE = r"C:\Users\hilli\PycharmProjects\adbhelper\.venv\scrcpy\scrcpy.exe"
+SCRCPY_EXE = r"C:\\Users\\hilli\\PycharmProjects\\adbhelper\\.venv\\scrcpy\\scrcpy.exe"
 DEVICE_SERIAL: Optional[str] = None  # e.g. "R5CT60SV0RX"
 SCRCPY_TITLE = "Android (Embedded)"
 DEFAULT_MAX_FPS = 60
 DEFAULT_BITRATE = "16M"
+DEFAULT_SCREENSHOT_DIR = "images"
 # ====================
 
 
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ScrcpyLaunchOptions:
+    """Configuration values used when launching scrcpy."""
+
+    max_fps: int = DEFAULT_MAX_FPS
+    bitrate: str = DEFAULT_BITRATE
+    stay_awake: bool = True
+    audio: bool = False
+
+    def __post_init__(self) -> None:
+        if self.max_fps <= 0:
+            raise ValueError("Frames per second must be greater than zero.")
+        if not str(self.bitrate).strip():
+            raise ValueError("Bitrate must be a non-empty value, e.g. '16M'.")
+
+    def to_arguments(self) -> List[str]:
+        """Return the list of scrcpy CLI arguments for the configured options."""
+
+        args = [
+            f"--window-title={SCRCPY_TITLE}",
+            "--window-borderless",
+            f"--max-fps={self.max_fps}",
+            f"--video-bit-rate={self.bitrate}",
+        ]
+        if self.stay_awake:
+            args.append("--stay-awake")
+        if not self.audio:
+            args.append("--no-audio")
+        return args
+
+
 def _resolve_scrcpy() -> Optional[str]:
+    """Return the path to the scrcpy executable if it can be resolved."""
+
     if SCRCPY_EXE and os.path.isfile(SCRCPY_EXE):
         return SCRCPY_EXE
+
     env = os.environ.get("SCRCPY_EXE")
     if env and os.path.isfile(env):
         return env
+
     from shutil import which
+
     return which("scrcpy")
 
 
 def get_first_device() -> Optional[str]:
+    """Return the first connected device according to ``adb devices``."""
+
     try:
-        out = subprocess.check_output(["adb", "devices"], stderr=subprocess.STDOUT).decode("utf-8","ignore")
-        for line in out.splitlines()[1:]:
-            if "\tdevice" in line:
-                return line.split("\t")[0]
-    except:
-        pass
+        out = subprocess.check_output(
+            ["adb", "devices"], stderr=subprocess.STDOUT
+        ).decode("utf-8", "ignore")
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        logger.warning("Unable to query adb devices: %s", exc)
+        return None
+
+    for line in out.splitlines()[1:]:
+        if not line.strip():
+            continue
+        serial, *rest = line.split("\t")
+        status = rest[0] if rest else ""
+        if status.strip() == "device":
+            return serial.strip()
+
     return None
 
 
 class ScrcpyController(QObject):
+    """Launches scrcpy and embeds the resulting native window."""
+
     started = pyqtSignal()
     stopped = pyqtSignal()
     error = pyqtSignal(str)
@@ -53,35 +121,49 @@ class ScrcpyController(QObject):
     def __init__(self, serial: Optional[str]):
         super().__init__()
         self.serial = serial
-        self.proc = None
-        self.hwnd = None
-        self.resolution = None
-        self.poll = QTimer()
+        self.proc: Optional[subprocess.Popen] = None
+        self.hwnd: Optional[int] = None
+        self.resolution: Optional[Tuple[int, int]] = None
+        self.poll = QTimer(self)
         self.poll.setInterval(250)
         self.poll.timeout.connect(self._find_window)
 
-    def start(self, fps=DEFAULT_MAX_FPS, bitrate=DEFAULT_BITRATE):
+    @property
+    def is_running(self) -> bool:
+        """Return ``True`` when scrcpy is currently running."""
+
+        return self.proc is not None and self.proc.poll() is None
+
+    def start(self, fps: int = DEFAULT_MAX_FPS, bitrate: str = DEFAULT_BITRATE) -> None:
+        """Start scrcpy using the provided configuration values."""
+
+        if self.is_running:
+            logger.debug("scrcpy is already running; ignoring duplicate start request.")
+            return
+
         if not self.serial:
             # Refresh the device serial each time we try to start in case a new
             # device has been plugged in since the controller was created.
             self.serial = get_first_device()
+            if not self.serial:
+                logger.info(
+                    "No device serial detected; scrcpy will attempt auto-detection."
+                )
 
         exe = _resolve_scrcpy()
         if not exe:
             self.error.emit("scrcpy.exe not found. Set SCRCPY_EXE to full path.")
             return
 
+        try:
+            options = ScrcpyLaunchOptions(max_fps=fps, bitrate=bitrate)
+        except ValueError as exc:
+            self.error.emit(str(exc))
+            return
+
         self._update_resolution()
 
-        args = [
-            exe,
-            f"--window-title={SCRCPY_TITLE}",
-            "--window-borderless",         # ✅ updated for scrcpy 3.2
-            f"--max-fps={fps}",
-            f"--video-bit-rate={bitrate}", # ✅ updated
-            "--stay-awake",
-            "--no-audio",
-        ]
+        args = [exe, *options.to_arguments()]
         if self.serial:
             args.insert(1, "-s")
             args.insert(2, self.serial)
@@ -93,70 +175,86 @@ class ScrcpyController(QObject):
                 self.proc = subprocess.Popen(args, creationflags=creation_flags)
             else:
                 self.proc = subprocess.Popen(args)
-        except Exception as e:
-            self.error.emit(str(e))
+        except Exception as exc:  # noqa: BLE001 - broad to surface error to UI
+            logger.error("Failed to start scrcpy: %s", exc)
+            self.error.emit(str(exc))
             return
 
+        logger.debug("Started scrcpy with args: %s", args)
         self.poll.start()
 
-    def stop(self):
+    def stop(self) -> None:
+        """Terminate the scrcpy process if it is running."""
+
         self.poll.stop()
+
         if self.proc and self.proc.poll() is None:
-            try: self.proc.terminate()
-            except: pass
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                logger.warning("scrcpy did not exit in time; killing the process.")
+                self.proc.kill()
+            except Exception as exc:  # noqa: BLE001 - ensure clean shutdown
+                logger.error("Error while stopping scrcpy: %s", exc)
+
         self.proc = None
         self.hwnd = None
         self.stopped.emit()
 
-    def _find_window(self):
+    def _find_window(self) -> None:
         hwnd = win32gui.FindWindow(None, SCRCPY_TITLE)
         if hwnd and win32gui.IsWindow(hwnd):
             self.hwnd = hwnd
             self.poll.stop()
             self.started.emit()
 
-    def _update_resolution(self):
+    def _update_resolution(self) -> None:
+        """Update the current device resolution via ``adb shell wm size``."""
+
+        cmd = ["adb"]
+        if self.serial:
+            cmd += ["-s", self.serial]
+        cmd += ["shell", "wm", "size"]
+
         try:
-            cmd = ["adb"]
-            if self.serial:
-                cmd += ["-s", self.serial]
-            cmd += ["shell", "wm", "size"]
-            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode("utf-8", "ignore")
-            for line in out.splitlines():
-                if "Physical size:" in line:
-                    size = line.split(":", 1)[1].strip()
-                    break
-                if "Override size:" in line:
-                    size = line.split(":", 1)[1].strip()
-                    break
-            else:
-                size = None
-            if size:
-                size = size.split()[0]
-                if "x" in size:
-                    w, h = size.split("x", 1)
-                    self.resolution = (int(w), int(h))
-                    return
-        except Exception:
-            pass
+            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode(
+                "utf-8", "ignore"
+            )
+        except Exception as exc:  # noqa: BLE001 - adb errors vary widely
+            logger.debug("Unable to query device resolution: %s", exc)
+            self.resolution = None
+            return
+
+        pattern = re.compile(r"(?:Physical|Override) size:\s*(\d+)x(\d+)")
+        for line in out.splitlines():
+            match = pattern.search(line)
+            if match:
+                width, height = match.groups()
+                self.resolution = (int(width), int(height))
+                return
+
         self.resolution = None
 
 
 class AndroidView(QWidget):
+    """Widget responsible for embedding and resizing the scrcpy window."""
+
     def __init__(self, controller: ScrcpyController):
         super().__init__()
         self.controller = controller
         self.setAttribute(Qt.WA_NativeWindow, True)
         self.setStyleSheet("background:#000;")
         controller.started.connect(self._embed)
-        self.r_timer = QTimer()
+        self.r_timer = QTimer(self)
         self.r_timer.setInterval(1000)
         self.r_timer.timeout.connect(self._resize_child)
         self.r_timer.start()
 
-    def _embed(self):
+    def _embed(self) -> None:
         hwnd = self.controller.hwnd
-        if not hwnd: return
+        if not hwnd:
+            return
         win32gui.SetParent(hwnd, int(self.winId()))
         style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
         style &= ~(win32con.WS_CAPTION | win32con.WS_THICKFRAME |
@@ -175,19 +273,19 @@ class AndroidView(QWidget):
         )
         self._resize_child()
 
-    def resizeEvent(self, e):
-        super().resizeEvent(e)
+    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        super().resizeEvent(event)
         self._resize_child()
 
-    def _resize_child(self):
+    def _resize_child(self) -> None:
         hwnd = self.controller.hwnd
         if hwnd:
-            r = self.rect()
-            width, height = r.width(), r.height()
+            rect = self.rect()
+            width, height = rect.width(), rect.height()
             x_off = 0
             y_off = 0
 
-            aspect = None
+            aspect: Optional[float] = None
             if self.controller.resolution and self.controller.resolution[1]:
                 aspect = self.controller.resolution[0] / self.controller.resolution[1]
             else:
@@ -218,6 +316,8 @@ class AndroidView(QWidget):
 
 
 class CropDialog(QDialog):
+    """Full screen dialog allowing the user to crop a screenshot."""
+
     def __init__(self, pixmap, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Crop Screenshot")
@@ -280,31 +380,31 @@ class CropDialog(QDialog):
 
         layout.addWidget(info_bar)
 
-    def eventFilter(self, watched, event):
+    def eventFilter(self, watched, event):  # noqa: N802 (Qt API)
         if watched is self.label:
             if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
                 self._origin = event.pos()
                 self.rubber_band.setGeometry(QRect(self._origin, QSize()))
                 self.rubber_band.show()
                 return True
-            elif event.type() == QEvent.MouseMove and self._origin is not None:
+            if event.type() == QEvent.MouseMove and self._origin is not None:
                 rect = QRect(self._origin, event.pos()).normalized()
                 self.rubber_band.setGeometry(rect)
                 return True
-            elif event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+            if event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
                 rect = QRect(self._origin, event.pos()).normalized() if self._origin else QRect()
                 self._selection = rect
                 self._origin = None
                 return True
         return super().eventFilter(watched, event)
 
-    def keyPressEvent(self, event):
+    def keyPressEvent(self, event) -> None:  # noqa: N802 (Qt API)
         if event.key() in (Qt.Key_Escape, Qt.Key_Q):
             self.reject()
             return
         super().keyPressEvent(event)
 
-    def accept(self):
+    def accept(self) -> None:  # noqa: N802 (Qt API)
         if not self._selection or self._selection.width() < 2 or self._selection.height() < 2:
             QMessageBox.warning(self, "Crop Screenshot", "Drag on the image to pick an area to save.")
             return
@@ -328,6 +428,8 @@ class CropDialog(QDialog):
 
 
 class MainWindow(QWidget):
+    """Primary window that manages the embedded scrcpy session."""
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Android — Embedded scrcpy")
@@ -345,12 +447,12 @@ class MainWindow(QWidget):
         self.status = QLabel(self._device_label())
         self.status.setStyleSheet("color:#bbb;")
 
-        self.btnStart.clicked.connect(lambda: self.ctrl.start())
+        self.btnStart.clicked.connect(self._on_start_clicked)
         self.btnStop.clicked.connect(self.ctrl.stop)
         self.btnScreenshot.clicked.connect(self._capture_screenshot)
         self.ctrl.started.connect(self._on_stream_started)
         self.ctrl.stopped.connect(self._on_stream_stopped)
-        self.ctrl.error.connect(lambda m: QMessageBox.critical(self, "scrcpy", m))
+        self.ctrl.error.connect(self._on_error)
 
         top = QHBoxLayout()
         top.addWidget(self.btnStart)
@@ -371,17 +473,35 @@ class MainWindow(QWidget):
         layout.addWidget(self.view)
         layout.setStretch(2, 1)
 
+        self._update_controls(running=False)
+
     def _device_label(self) -> str:
         return f"Device: {self.ctrl.serial or 'Not Found'}"
 
-    def _on_stream_started(self):
+    def _update_controls(self, running: bool) -> None:
+        self.btnStart.setEnabled(not running)
+        self.btnStop.setEnabled(running)
+        self.btnScreenshot.setEnabled(running)
+
+    def _on_stream_started(self) -> None:
         self.status.setText(f"{self._device_label()} — STREAMING")
+        self._update_controls(running=True)
         self._resize_window_to_device()
 
-    def _on_stream_stopped(self):
+    def _on_stream_stopped(self) -> None:
         self.status.setText(f"{self._device_label()} — STOPPED")
+        self._update_controls(running=False)
 
-    def _resize_window_to_device(self):
+    def _on_start_clicked(self) -> None:
+        self.status.setText(f"{self._device_label()} — STARTING…")
+        self.ctrl.start()
+
+    def _on_error(self, message: str) -> None:
+        self.status.setText(f"{self._device_label()} — ERROR")
+        QMessageBox.critical(self, "scrcpy", message)
+        self._update_controls(running=False)
+
+    def _resize_window_to_device(self) -> None:
         if not self.ctrl.resolution:
             return
 
@@ -410,7 +530,7 @@ class MainWindow(QWidget):
 
         self.resize(target_w + chrome_width, target_h + chrome_height)
 
-    def _capture_screenshot(self):
+    def _capture_screenshot(self) -> None:
         screen = QApplication.primaryScreen()
         if not screen:
             QMessageBox.warning(self, "Screenshot", "No primary screen available.")
@@ -436,7 +556,13 @@ class MainWindow(QWidget):
             return
 
         cropped = dialog.selected_pixmap()
-        name, ok = QInputDialog.getText(self, "Save Screenshot", "File name:", text="screenshot")
+        default_name = "screenshot"
+        name, ok = QInputDialog.getText(
+            self,
+            "Save Screenshot",
+            "File name:",
+            text=default_name,
+        )
         if not ok:
             return
 
@@ -448,8 +574,8 @@ class MainWindow(QWidget):
         if not name.lower().endswith(".png"):
             name += ".png"
 
-        os.makedirs("images", exist_ok=True)
-        path = os.path.join("images", name)
+        os.makedirs(DEFAULT_SCREENSHOT_DIR, exist_ok=True)
+        path = os.path.join(DEFAULT_SCREENSHOT_DIR, name)
 
         if not cropped.save(path, "PNG"):
             QMessageBox.critical(self, "Screenshot", "Failed to save screenshot.")
@@ -457,11 +583,19 @@ class MainWindow(QWidget):
 
         QMessageBox.information(self, "Screenshot", f"Saved screenshot to:\n{os.path.abspath(path)}")
 
+    def closeEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        self.ctrl.stop()
+        super().closeEvent(event)
 
-def main():
+
+def main() -> None:
+    """Entrypoint used when launching the script directly."""
+
+    logging.basicConfig(level=logging.INFO)
+
     app = QApplication(sys.argv)
-    w = MainWindow()
-    w.show()
+    window = MainWindow()
+    window.show()
     sys.exit(app.exec_())
 
 
