@@ -39,10 +39,11 @@ import win32con
 import win32gui
 
 # ====== CONFIG ======
-SCRCPY_EXE = r"C:\\Users\\hilli\\PycharmProjects\\adbhelper\\.venv\\scrcpy\\scrcpy.exe"
+SCRCPY_EXE = "C:\\Tools\\scrcpy\\scrcpy.exe"
+SNDCPY_EXE = "C:\\Tools\\sndcpy\\sndcpy.bat"
 DEVICE_SERIAL: Optional[str] = None  # e.g. "R5CT60SV0RX"
-SCRCPY_TITLE = "Android (Embedded)"
-DEFAULT_MAX_FPS = 60
+SCRCPY_TITLE = "ShadowCastX-Touch Android"
+DEFAULT_MAX_FPS = 240
 DEFAULT_BITRATE = "16M"
 DEFAULT_SCREENSHOT_DIR = "images"
 
@@ -188,6 +189,21 @@ def _resolve_scrcpy() -> Optional[str]:
     return which("scrcpy")
 
 
+def _resolve_sndcpy() -> Optional[str]:
+    """Return the path to the sndcpy executable if it can be resolved."""
+
+    if SNDCPY_EXE and os.path.exists(SNDCPY_EXE):
+        return SNDCPY_EXE
+
+    env = os.environ.get("SNDCPY_EXE")
+    if env and os.path.exists(env):
+        return env
+
+    from shutil import which
+
+    return which("sndcpy")
+
+
 def list_connected_devices() -> List[DeviceInfo]:
     """Return all devices reported by ``adb devices``."""
 
@@ -251,6 +267,10 @@ class ScrcpyController(QObject):
         self._audio_requested = False
         self._audio_warning_emitted = False
         self._stopping = False
+        self._sndcpy_proc: Optional[subprocess.Popen] = None
+        self._sndcpy_reader: Optional[threading.Thread] = None
+        self._sndcpy_monitor: Optional[threading.Thread] = None
+        self._sndcpy_prompt_ack = False
 
     @property
     def is_running(self) -> bool:
@@ -291,7 +311,7 @@ class ScrcpyController(QObject):
                 max_fps=fps,
                 bitrate=bitrate,
                 stay_awake=stay_awake,
-                audio=audio,
+                audio=False,
             )
         except ValueError as exc:
             self.error.emit(str(exc))
@@ -299,8 +319,14 @@ class ScrcpyController(QObject):
 
         self._update_resolution()
 
-        self._audio_requested = audio
         self._audio_warning_emitted = False
+        audio_enabled = False
+        if audio:
+            audio_enabled = self._start_sndcpy()
+        else:
+            self._stop_sndcpy()
+
+        self._audio_requested = audio_enabled
         self._stderr_queue = SimpleQueue()
         self._stderr_thread = None
 
@@ -322,6 +348,8 @@ class ScrcpyController(QObject):
         except Exception as exc:  # noqa: BLE001 - broad to surface error to UI
             logger.error("Failed to start scrcpy: %s", exc)
             self.error.emit(str(exc))
+            if audio_enabled:
+                self._stop_sndcpy()
             return
 
         if self.proc and self.proc.stderr:
@@ -356,6 +384,7 @@ class ScrcpyController(QObject):
 
         self.proc = None
         self.hwnd = None
+        self._stop_sndcpy()
         self.stopped.emit()
 
     def _find_window(self) -> None:
@@ -433,18 +462,156 @@ class ScrcpyController(QObject):
         stripped = line.strip()
         if stripped:
             logger.debug("scrcpy stderr: %s", stripped)
-        if (
-            self._audio_requested
-            and not self._audio_warning_emitted
-            and (
-                "Cannot create AudioRecord" in line
-                or "stream explicitly disabled by the device" in line
+        if self._audio_requested and not self._audio_warning_emitted:
+            if "Cannot create AudioRecord" in line or "stream explicitly disabled by the device" in line:
+                self._notify_audio_unavailable(
+                    "Audio capture is not available on this device. Streaming will continue without audio."
+                )
+
+    def _notify_audio_unavailable(self, message: str) -> None:
+        if self._audio_warning_emitted:
+            return
+        self._audio_warning_emitted = True
+        self._audio_requested = False
+        self.audio_unavailable.emit(message)
+
+    def _start_sndcpy(self) -> bool:
+        exe = _resolve_sndcpy()
+        if not exe:
+            self._notify_audio_unavailable(
+                "sndcpy executable not found. Audio will be disabled for this session."
             )
-        ):
-            self._audio_warning_emitted = True
-            self.audio_unavailable.emit(
-                "Audio capture is not available on this device. Streaming will continue without audio."
+            return False
+
+        self._stop_sndcpy()
+        self._sndcpy_prompt_ack = False
+
+        args = [exe]
+        lower_exe = exe.lower()
+        if lower_exe.endswith((".bat", ".cmd")):
+            args = ["cmd.exe", "/c", exe]
+
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        popen_kwargs = {
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "text": True,
+            "bufsize": 1,
+        }
+        env = os.environ.copy()
+        if self.serial:
+            env["ANDROID_SERIAL"] = self.serial
+            env["ADB_SERIAL"] = self.serial
+
+        try:
+            if creation_flags:
+                proc = subprocess.Popen(
+                    args,
+                    creationflags=creation_flags,
+                    env=env,
+                    **popen_kwargs,
+                )
+            else:
+                proc = subprocess.Popen(args, env=env, **popen_kwargs)
+        except FileNotFoundError:
+            self._notify_audio_unavailable(
+                "sndcpy executable not found. Audio will be disabled for this session."
             )
+            return False
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to start sndcpy: %s", exc)
+            self._notify_audio_unavailable(f"Unable to start sndcpy: {exc}")
+            return False
+
+        self._sndcpy_proc = proc
+        self._sndcpy_reader = threading.Thread(
+            target=self._read_sndcpy_output,
+            name="sndcpy-stdout",
+            daemon=True,
+        )
+        self._sndcpy_reader.start()
+        self._sndcpy_monitor = threading.Thread(
+            target=self._monitor_sndcpy,
+            name="sndcpy-monitor",
+            daemon=True,
+        )
+        self._sndcpy_monitor.start()
+        return True
+
+    def _read_sndcpy_output(self) -> None:
+        proc = self._sndcpy_proc
+        if not proc or not proc.stdout:
+            return
+
+        for line in iter(proc.stdout.readline, ""):
+            stripped = line.strip()
+            if stripped:
+                logger.debug("sndcpy: %s", stripped)
+            if "press enter" in line.lower():
+                self._send_sndcpy_enter()
+
+        try:
+            proc.stdout.close()
+        except Exception:  # noqa: BLE001 - best effort cleanup
+            pass
+
+    def _send_sndcpy_enter(self) -> None:
+        if self._sndcpy_prompt_ack:
+            return
+        proc = self._sndcpy_proc
+        if not proc or not proc.stdin:
+            return
+        try:
+            proc.stdin.write("\n")
+            proc.stdin.flush()
+            self._sndcpy_prompt_ack = True
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Unable to acknowledge sndcpy prompt: %s", exc)
+
+    def _monitor_sndcpy(self) -> None:
+        proc = self._sndcpy_proc
+        if not proc:
+            return
+        try:
+            code = proc.wait()
+        except Exception:  # noqa: BLE001 - suppress teardown issues
+            return
+
+        if code not in (0, None) and self._audio_requested and not self._stopping:
+            self._notify_audio_unavailable(
+                "sndcpy exited unexpectedly. Audio playback will stop."
+            )
+
+    def _stop_sndcpy(self) -> None:
+        proc = self._sndcpy_proc
+        if not proc:
+            self._sndcpy_proc = None
+            self._sndcpy_prompt_ack = False
+            self._audio_requested = False
+            return
+
+        self._sndcpy_proc = None
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            logger.debug("sndcpy did not exit in time; killing the process.")
+            proc.kill()
+        except Exception as exc:  # noqa: BLE001 - ensure shutdown continues
+            logger.debug("Error while stopping sndcpy: %s", exc)
+        finally:
+            for stream in (getattr(proc, "stdout", None), getattr(proc, "stdin", None)):
+                if stream:
+                    try:
+                        stream.close()
+                    except Exception:  # noqa: BLE001 - ignore close errors
+                        pass
+            self._sndcpy_reader = None
+            self._sndcpy_monitor = None
+            self._sndcpy_prompt_ack = False
+            self._audio_requested = False
 
     def _clear_output_queue(self) -> None:
         while True:
@@ -672,7 +839,7 @@ class MainWindow(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Android — Embedded scrcpy")
+        self.setWindowTitle("ShadowCastX-Touch Android")
         self.resize(1400, 840)
 
         device = DEVICE_SERIAL or get_first_device()
@@ -712,7 +879,9 @@ class MainWindow(QWidget):
         self.stayAwakeCheck.setChecked(True)
 
         self.audioCheck = QCheckBox("Enable audio")
-        self.audioCheck.setToolTip("Capture audio in addition to video when supported.")
+        self.audioCheck.setToolTip(
+            "Capture audio in addition to video via sndcpy when available."
+        )
         self.audioCheck.setChecked(False)
 
         self.btnStart = QPushButton("Start Stream")
