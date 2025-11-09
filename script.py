@@ -45,6 +45,7 @@ SCRCPY_TITLE = "Android (Embedded)"
 DEFAULT_MAX_FPS = 60
 DEFAULT_BITRATE = "16M"
 DEFAULT_SCREENSHOT_DIR = "images"
+DEFAULT_AUDIO_OUTPUT = "win32" if sys.platform.startswith("win") else None
 
 BITRATE_PATTERN = re.compile(r"^\d+(?:\.\d+)?(?:[KMG](?:bit/s)?)?$", re.IGNORECASE)
 
@@ -138,6 +139,7 @@ class ScrcpyLaunchOptions:
     bitrate: str = DEFAULT_BITRATE
     stay_awake: bool = True
     audio: bool = False
+    audio_output: Optional[str] = DEFAULT_AUDIO_OUTPUT
 
     def __post_init__(self) -> None:
         if self.max_fps <= 0:
@@ -158,6 +160,8 @@ class ScrcpyLaunchOptions:
             args.append("--stay-awake")
         if not self.audio:
             args.append("--no-audio")
+        elif self.audio_output:
+            args.append(f"--audio-output={self.audio_output}")
         return args
 
 
@@ -186,6 +190,17 @@ def _resolve_scrcpy() -> Optional[str]:
     from shutil import which
 
     return which("scrcpy")
+
+
+def _resolve_audio_output() -> Optional[str]:
+    """Return the preferred audio output sink for scrcpy."""
+
+    env = os.environ.get("SCRCPY_AUDIO_OUTPUT")
+    if env is not None:
+        stripped = env.strip()
+        return stripped or None
+
+    return DEFAULT_AUDIO_OUTPUT
 
 
 def list_connected_devices() -> List[DeviceInfo]:
@@ -292,6 +307,7 @@ class ScrcpyController(QObject):
                 bitrate=bitrate,
                 stay_awake=stay_awake,
                 audio=audio,
+                audio_output=_resolve_audio_output(),
             )
         except ValueError as exc:
             self.error.emit(str(exc))
