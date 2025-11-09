@@ -776,14 +776,29 @@ class MainWindow(QWidget):
             QMessageBox.warning(self, "Screenshot", "No primary screen available.")
             return
 
-        pixmap = screen.grabWindow(self.view.winId())
+        target_hwnd = self.ctrl.hwnd or int(self.view.winId())
+        pixmap = screen.grabWindow(int(target_hwnd))
         if pixmap.isNull():
             QMessageBox.warning(self, "Screenshot", "Unable to capture screenshot.")
             return
 
+        device_pixel_ratio = pixmap.devicePixelRatio()
+        if device_pixel_ratio and abs(device_pixel_ratio - 1.0) > 1e-3:
+            pixmap = pixmap.scaled(
+                int(round(pixmap.width() * device_pixel_ratio)),
+                int(round(pixmap.height() * device_pixel_ratio)),
+                Qt.IgnoreAspectRatio,
+                Qt.SmoothTransformation,
+            )
+            pixmap.setDevicePixelRatio(1.0)
+
         if self.ctrl.resolution:
             device_w, device_h = self.ctrl.resolution
-            if device_w and device_h:
+            if (
+                device_w
+                and device_h
+                and (pixmap.width() != device_w or pixmap.height() != device_h)
+            ):
                 pixmap = pixmap.scaled(
                     device_w,
                     device_h,
