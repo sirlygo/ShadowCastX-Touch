@@ -48,6 +48,10 @@ DEFAULT_BITRATE = "16M"
 DEFAULT_SCREENSHOT_DIR = "images"
 
 BITRATE_PATTERN = re.compile(r"^\d+(?:\.\d+)?(?:[KMG](?:bit/s)?)?$", re.IGNORECASE)
+SNDCPY_STOP_PROMPT_PATTERN = re.compile(
+    r"press\s+enter\s+to\s+(stop|quit|exit|close|end|terminate|finish)\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -557,16 +561,7 @@ class ScrcpyController(QObject):
                 #      acknowledging the prompt should continue playback.
                 #   2. To stop playback ("Press Enter to stop"), which should
                 #      be ignored or audio ends immediately.
-                stop_keywords = (
-                    "stop",
-                    "quit",
-                    "exit",
-                    "close",
-                    "end",
-                    "terminate",
-                    "finish",
-                )
-                if not any(keyword in lower for keyword in stop_keywords):
+                if not SNDCPY_STOP_PROMPT_PATTERN.search(lower):
                     self._send_sndcpy_enter()
 
         try:
