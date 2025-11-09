@@ -11,6 +11,7 @@ ShadowCastX-Touch is a lightweight PyQt5 application that embeds a [`scrcpy`](ht
 
 - Windows 10/11 with [ADB](https://developer.android.com/tools/adb) available on the `PATH`.
 - [`scrcpy` 3.x](https://github.com/Genymobile/scrcpy) installed locally. You can either place the binary on the `PATH` or point `SCRCPY_EXE` at the executable.
+- [`sndcpy`](https://github.com/Genymobile/sndcpy) available when you want audio capture. Place it on the `PATH` or reference it with `SNDCPY_EXE`.
 - Python 3.9+ with the following packages installed:
   - `PyQt5`
   - `pywin32`
@@ -24,6 +25,7 @@ pip install PyQt5 pywin32
 The application can be configured through module-level constants in `script.py` or environment variables:
 
 - `SCRCPY_EXE` – Absolute path to the scrcpy executable. If omitted, the script will fall back to the environment variable of the same name and finally to whatever is on the `PATH`.
+- `SNDCPY_EXE` – Optional path to the sndcpy executable or script used for audio capture.
 - `DEVICE_SERIAL` – Optional Android device serial to bind to on startup. When omitted the first available device is used.
 - `DEFAULT_MAX_FPS` / `DEFAULT_BITRATE` – Default stream quality values.
 - `DEFAULT_SCREENSHOT_DIR` – Destination folder for saved screenshots.
@@ -40,7 +42,8 @@ python script.py
 
 4. (Optional) Pick a specific device from the **Device** drop-down, then click **Refresh** if you plug in a new device while the app is running.
 5. Click **Start Stream** to launch the embedded scrcpy session.
-6. Use **Screenshot** to capture the current frame, optionally cropping before saving.
+6. (Optional) Enable **Audio** before starting to mirror sound through sndcpy. The first launch may require accepting the capture prompt on your device.
+7. Use **Screenshot** to capture the current frame, optionally cropping before saving.
 
 The application provides basic status messaging and automatically shuts down the scrcpy process when you close the window.
 
