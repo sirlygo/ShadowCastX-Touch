@@ -708,7 +708,15 @@ class AndroidView(QWidget):
                 y_off = (height - target_height) // 2
                 width, height = target_width, target_height
 
-            win32gui.MoveWindow(hwnd, x_off, y_off, width, height, True)
+            scale = self.devicePixelRatioF()
+            win32gui.MoveWindow(
+                hwnd,
+                int(round(x_off * scale)),
+                int(round(y_off * scale)),
+                int(round(width * scale)),
+                int(round(height * scale)),
+                True,
+            )
 
 
 class CropDialog(QDialog):
