@@ -929,12 +929,18 @@ class MainWindow(QWidget):
         if self.ctrl.resolution:
             device_w, device_h = self.ctrl.resolution
             if device_w and device_h:
-                pixmap = pixmap.scaled(
-                    device_w,
-                    device_h,
-                    Qt.IgnoreAspectRatio,
-                    Qt.SmoothTransformation,
-                )
+                pixmap_w = pixmap.width()
+                pixmap_h = pixmap.height()
+                if pixmap_w and pixmap_h:
+                    pixmap_ratio = pixmap_w / pixmap_h
+                    device_ratio = device_w / device_h
+                    if abs(pixmap_ratio - device_ratio) <= 0.01:
+                        pixmap = pixmap.scaled(
+                            device_w,
+                            device_h,
+                            Qt.IgnoreAspectRatio,
+                            Qt.SmoothTransformation,
+                        )
 
         dialog = CropDialog(pixmap, self)
         if dialog.exec_() != QDialog.Accepted:
