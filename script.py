@@ -10,20 +10,25 @@ import sys
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+from datetime import datetime
+
 from PyQt5.QtCore import QEvent, QRect, QSize, Qt, QTimer, QObject, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QSizePolicy,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
-    QInputDialog,
     QRubberBand,
 )
 
@@ -37,6 +42,8 @@ SCRCPY_TITLE = "Android (Embedded)"
 DEFAULT_MAX_FPS = 60
 DEFAULT_BITRATE = "16M"
 DEFAULT_SCREENSHOT_DIR = "images"
+
+BITRATE_PATTERN = re.compile(r"^\d+(?:\.\d+)?(?:[KMG](?:bit/s)?)?$", re.IGNORECASE)
 # ====================
 
 
@@ -134,7 +141,14 @@ class ScrcpyController(QObject):
 
         return self.proc is not None and self.proc.poll() is None
 
-    def start(self, fps: int = DEFAULT_MAX_FPS, bitrate: str = DEFAULT_BITRATE) -> None:
+    def start(
+        self,
+        fps: int = DEFAULT_MAX_FPS,
+        bitrate: str = DEFAULT_BITRATE,
+        *,
+        stay_awake: bool = True,
+        audio: bool = False,
+    ) -> None:
         """Start scrcpy using the provided configuration values."""
 
         if self.is_running:
@@ -156,7 +170,12 @@ class ScrcpyController(QObject):
             return
 
         try:
-            options = ScrcpyLaunchOptions(max_fps=fps, bitrate=bitrate)
+            options = ScrcpyLaunchOptions(
+                max_fps=fps,
+                bitrate=bitrate,
+                stay_awake=stay_awake,
+                audio=audio,
+            )
         except ValueError as exc:
             self.error.emit(str(exc))
             return
@@ -441,6 +460,28 @@ class MainWindow(QWidget):
         self.view = AndroidView(self.ctrl)
         self.view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
+        self.fpsSpin = QSpinBox()
+        self.fpsSpin.setRange(1, 240)
+        self.fpsSpin.setValue(DEFAULT_MAX_FPS)
+        self.fpsSpin.setSuffix(" fps")
+        self.fpsSpin.setToolTip("Maximum frames per second to request from scrcpy.")
+        self.fpsSpin.setAccelerated(True)
+
+        self.bitrateInput = QLineEdit(DEFAULT_BITRATE)
+        self.bitrateInput.setPlaceholderText(DEFAULT_BITRATE)
+        self.bitrateInput.setToolTip(
+            "Video bitrate passed to scrcpy. Examples: 16M, 8Mbit/s, 8000K."
+        )
+        self.bitrateInput.setClearButtonEnabled(True)
+        self.bitrateInput.setFixedWidth(110)
+
+        self.stayAwakeCheck = QCheckBox("Keep device awake")
+        self.stayAwakeCheck.setChecked(True)
+
+        self.audioCheck = QCheckBox("Enable audio")
+        self.audioCheck.setToolTip("Capture audio in addition to video when supported.")
+        self.audioCheck.setChecked(False)
+
         self.btnStart = QPushButton("Start Stream")
         self.btnStop = QPushButton("Stop")
         self.btnScreenshot = QPushButton("Screenshot")
@@ -453,6 +494,26 @@ class MainWindow(QWidget):
         self.ctrl.started.connect(self._on_stream_started)
         self.ctrl.stopped.connect(self._on_stream_stopped)
         self.ctrl.error.connect(self._on_error)
+
+        config_bar = QWidget()
+        config_layout = QHBoxLayout(config_bar)
+        config_layout.setContentsMargins(0, 0, 0, 0)
+        config_layout.setSpacing(12)
+
+        fps_label = QLabel("Max FPS:")
+        fps_label.setStyleSheet("color:#bbb;")
+        config_layout.addWidget(fps_label)
+        config_layout.addWidget(self.fpsSpin)
+
+        bitrate_label = QLabel("Bitrate:")
+        bitrate_label.setStyleSheet("color:#bbb;")
+        config_layout.addWidget(bitrate_label)
+        config_layout.addWidget(self.bitrateInput)
+
+        config_layout.addSpacing(10)
+        config_layout.addWidget(self.stayAwakeCheck)
+        config_layout.addWidget(self.audioCheck)
+        config_layout.addStretch(1)
 
         top = QHBoxLayout()
         top.addWidget(self.btnStart)
@@ -468,6 +529,7 @@ class MainWindow(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(6)
+        layout.addWidget(config_bar)
         layout.addLayout(top)
         layout.addWidget(line)
         layout.addWidget(self.view)
@@ -482,6 +544,48 @@ class MainWindow(QWidget):
         self.btnStart.setEnabled(not running)
         self.btnStop.setEnabled(running)
         self.btnScreenshot.setEnabled(running)
+        self.fpsSpin.setEnabled(not running)
+        self.bitrateInput.setEnabled(not running)
+        self.stayAwakeCheck.setEnabled(not running)
+        self.audioCheck.setEnabled(not running)
+
+    def _gather_launch_settings(self) -> Optional[Tuple[int, str, bool, bool]]:
+        bitrate = self._validated_bitrate()
+        if bitrate is None:
+            QMessageBox.warning(
+                self,
+                "scrcpy",
+                "Enter a bitrate like 16M, 8Mbit/s or 8000K.",
+            )
+            self.bitrateInput.setFocus()
+            self.bitrateInput.selectAll()
+            return None
+
+        return (
+            self.fpsSpin.value(),
+            bitrate,
+            self.stayAwakeCheck.isChecked(),
+            self.audioCheck.isChecked(),
+        )
+
+    def _validated_bitrate(self) -> Optional[str]:
+        text = self.bitrateInput.text().strip()
+        if not text:
+            return DEFAULT_BITRATE
+
+        if not BITRATE_PATTERN.fullmatch(text):
+            return None
+
+        suffix = ""
+        if text.lower().endswith("bit/s"):
+            text = text[:-5]
+            suffix = "bit/s"
+
+        normalized = text.strip().upper()
+        if not normalized:
+            return None
+
+        return f"{normalized}{suffix}" if suffix else normalized
 
     def _on_stream_started(self) -> None:
         self.status.setText(f"{self._device_label()} — STREAMING")
@@ -493,8 +597,13 @@ class MainWindow(QWidget):
         self._update_controls(running=False)
 
     def _on_start_clicked(self) -> None:
+        settings = self._gather_launch_settings()
+        if not settings:
+            return
+
+        fps, bitrate, stay_awake, audio = settings
         self.status.setText(f"{self._device_label()} — STARTING…")
-        self.ctrl.start()
+        self.ctrl.start(fps, bitrate, stay_awake=stay_awake, audio=audio)
 
     def _on_error(self, message: str) -> None:
         self.status.setText(f"{self._device_label()} — ERROR")
@@ -556,7 +665,7 @@ class MainWindow(QWidget):
             return
 
         cropped = dialog.selected_pixmap()
-        default_name = "screenshot"
+        default_name = datetime.now().strftime("screenshot-%Y%m%d-%H%M%S")
         name, ok = QInputDialog.getText(
             self,
             "Save Screenshot",
