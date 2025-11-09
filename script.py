@@ -41,6 +41,24 @@ import win32gui
 # ====== CONFIG ======
 SCRCPY_EXE = "C:\\Tools\\scrcpy\\scrcpy.exe"
 SNDCPY_EXE = "C:\\Tools\\sndcpy\\sndcpy.bat"
+SNDCPY_START_KEYWORDS = (
+    "start",
+    "ready",
+    "grant",
+    "allow",
+    "enable",
+    "begin",
+    "permission",
+    "continue",
+)
+SNDCPY_STOP_KEYWORDS = (
+    "stop",
+    "exit",
+    "quit",
+    "close",
+    "terminate",
+    "end",
+)
 DEVICE_SERIAL: Optional[str] = None  # e.g. "R5CT60SV0RX"
 SCRCPY_TITLE = "ShadowCastX-Touch Android"
 DEFAULT_MAX_FPS = 240
@@ -548,7 +566,21 @@ class ScrcpyController(QObject):
             stripped = line.strip()
             if stripped:
                 logger.debug("sndcpy: %s", stripped)
-            if "press enter" in line.lower():
+
+            lower = line.lower()
+            if "press enter" in lower and not self._sndcpy_prompt_ack:
+                has_stop = any(keyword in lower for keyword in SNDCPY_STOP_KEYWORDS)
+                has_start = any(keyword in lower for keyword in SNDCPY_START_KEYWORDS)
+                if has_stop and not has_start:
+                    logger.debug(
+                        "Ignoring sndcpy stop prompt: %s", stripped or line.strip()
+                    )
+                    continue
+
+                # Acknowledge the first startup "Press Enter" prompt so
+                # playback can begin automatically. Subsequent prompts are
+                # ignored because ``_sndcpy_prompt_ack`` will be ``True`` after
+                # the initial acknowledgement.
                 self._send_sndcpy_enter()
 
         try:
