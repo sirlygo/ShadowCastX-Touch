@@ -10,7 +10,7 @@ import sys
 import threading
 from dataclasses import dataclass
 from queue import Empty, SimpleQueue
-from typing import IO, List, Optional, Tuple
+from typing import IO, Dict, List, Optional, Tuple
 
 from datetime import datetime
 
@@ -47,6 +47,9 @@ DEFAULT_BITRATE = "16M"
 DEFAULT_SCREENSHOT_DIR = "images"
 
 BITRATE_PATTERN = re.compile(r"^\d+(?:\.\d+)?(?:[KMG](?:bit/s)?)?$", re.IGNORECASE)
+
+
+_SCRCPY_AUDIO_SUPPORT_CACHE: Dict[str, bool] = {}
 
 
 @dataclass(frozen=True)
@@ -156,7 +159,9 @@ class ScrcpyLaunchOptions:
         ]
         if self.stay_awake:
             args.append("--stay-awake")
-        if not self.audio:
+        if self.audio:
+            args.append("--audio")
+        else:
             args.append("--no-audio")
         return args
 
@@ -186,6 +191,27 @@ def _resolve_scrcpy() -> Optional[str]:
     from shutil import which
 
     return which("scrcpy")
+
+
+def _scrcpy_supports_audio(executable: str) -> bool:
+    """Return ``True`` if the scrcpy binary advertises the ``--audio`` flag."""
+
+    cached = _SCRCPY_AUDIO_SUPPORT_CACHE.get(executable)
+    if cached is not None:
+        return cached
+
+    try:
+        help_output = subprocess.check_output(
+            [executable, "--help"], stderr=subprocess.STDOUT
+        ).decode("utf-8", "ignore")
+    except Exception as exc:  # noqa: BLE001 - detection errors vary by install
+        logger.debug("Unable to determine scrcpy audio support: %s", exc)
+        _SCRCPY_AUDIO_SUPPORT_CACHE[executable] = False
+        return False
+
+    supports_audio = bool(re.search(r"\n\s*--audio(?:[ =]|$)", help_output))
+    _SCRCPY_AUDIO_SUPPORT_CACHE[executable] = supports_audio
+    return supports_audio
 
 
 def list_connected_devices() -> List[DeviceInfo]:
@@ -286,6 +312,16 @@ class ScrcpyController(QObject):
             self.error.emit("scrcpy.exe not found. Set SCRCPY_EXE to full path.")
             return
 
+        requested_audio = audio
+        audio_support_warning: Optional[str] = None
+        if audio and not _scrcpy_supports_audio(exe):
+            audio = False
+            logger.info("scrcpy binary at %s does not advertise --audio; disabling host audio.", exe)
+            audio_support_warning = (
+                "The configured scrcpy binary does not support audio forwarding. "
+                "Streaming will continue without audio."
+            )
+
         try:
             options = ScrcpyLaunchOptions(
                 max_fps=fps,
@@ -299,7 +335,7 @@ class ScrcpyController(QObject):
 
         self._update_resolution()
 
-        self._audio_requested = audio
+        self._audio_requested = requested_audio
         self._audio_warning_emitted = False
         self._stderr_queue = SimpleQueue()
         self._stderr_thread = None
@@ -323,6 +359,10 @@ class ScrcpyController(QObject):
             logger.error("Failed to start scrcpy: %s", exc)
             self.error.emit(str(exc))
             return
+
+        if audio_support_warning:
+            self._audio_warning_emitted = True
+            self.audio_unavailable.emit(audio_support_warning)
 
         if self.proc and self.proc.stderr:
             self._start_output_reader(self.proc.stderr)
