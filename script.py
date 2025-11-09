@@ -720,25 +720,55 @@ class MainWindow(QWidget):
             return
 
         available = screen.availableGeometry()
-        max_width = available.width() * 0.9
-        max_height = available.height() * 0.9
-
         device_w, device_h = self.ctrl.resolution
-        if not device_h:
+        if not device_w or not device_h:
             return
 
-        scale = min(max_width / device_w, max_height / device_h)
-        scale = max(scale, 0.25)
+        layout = self.layout()
+        if not layout:
+            return
 
-        target_w = int(device_w * scale)
-        target_h = int(device_h * scale)
+        def _item_height(index: int) -> int:
+            item = layout.itemAt(index)
+            if not item:
+                return 0
+            widget = item.widget()
+            if widget and widget.isVisible():
+                return widget.height()
+            hint = item.sizeHint()
+            return hint.height()
 
-        view_h = max(1, self.view.height())
-        view_w = max(1, self.view.width())
-        chrome_height = max(0, self.height() - view_h)
-        chrome_width = max(0, self.width() - view_w)
+        margins = layout.contentsMargins()
+        spacing_total = layout.spacing() * max(0, layout.count() - 1)
+        header_height = (
+            margins.top()
+            + margins.bottom()
+            + _item_height(0)
+            + _item_height(1)
+            + _item_height(2)
+            + spacing_total
+        )
+        horizontal_chrome = margins.left() + margins.right()
 
-        self.resize(target_w + chrome_width, target_h + chrome_height)
+        frame_extra_w = max(0, self.frameGeometry().width() - self.geometry().width())
+        frame_extra_h = max(0, self.frameGeometry().height() - self.geometry().height())
+
+        max_view_width = max(1, available.width() - horizontal_chrome - frame_extra_w)
+        max_view_height = max(1, available.height() - header_height - frame_extra_h)
+
+        scale = min(max_view_width / device_w, max_view_height / device_h)
+        if scale <= 0:
+            return
+
+        target_w = max(1, int(device_w * scale))
+        target_h = max(1, int(device_h * scale))
+
+        self.view.setMinimumSize(target_w, target_h)
+        self.view.resize(target_w, target_h)
+
+        total_width = target_w + horizontal_chrome + frame_extra_w
+        total_height = target_h + header_height + frame_extra_h
+        self.resize(total_width, total_height)
 
     def _capture_screenshot(self) -> None:
         screen = QApplication.primaryScreen()
