@@ -544,11 +544,23 @@ class ScrcpyController(QObject):
         if not proc or not proc.stdout:
             return
 
+        stop_keywords = ("stop", "exit", "close", "quit")
         for line in iter(proc.stdout.readline, ""):
             stripped = line.strip()
             if stripped:
                 logger.debug("sndcpy: %s", stripped)
-            if "press enter" in line.lower():
+
+            lower = line.lower()
+            if "press enter" in lower and not self._sndcpy_prompt_ack:
+                if any(keyword in lower for keyword in stop_keywords):
+                    logger.debug("Ignoring sndcpy prompt containing stop keyword.")
+                    continue
+
+                # Acknowledge the first start/permission prompt so playback can
+                # begin automatically. Prompts asking to stop playback are
+                # skipped by the keyword check above and later prompts are
+                # ignored because ``_sndcpy_prompt_ack`` becomes ``True`` after
+                # the initial acknowledgement.
                 self._send_sndcpy_enter()
 
         try:
