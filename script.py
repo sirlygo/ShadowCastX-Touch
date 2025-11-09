@@ -271,6 +271,7 @@ class ScrcpyController(QObject):
         self._sndcpy_reader: Optional[threading.Thread] = None
         self._sndcpy_monitor: Optional[threading.Thread] = None
         self._sndcpy_prompt_ack = False
+        self._sndcpy_last_output: str = ""
 
     @property
     def is_running(self) -> bool:
@@ -485,6 +486,7 @@ class ScrcpyController(QObject):
 
         self._stop_sndcpy()
         self._sndcpy_prompt_ack = False
+        self._sndcpy_last_output = ""
 
         args = [exe]
         lower_exe = exe.lower()
@@ -548,13 +550,62 @@ class ScrcpyController(QObject):
             stripped = line.strip()
             if stripped:
                 logger.debug("sndcpy: %s", stripped)
-            if "press enter" in line.lower():
+
+            lower = line.lower()
+            if "press enter" in lower and self._should_ack_sndcpy_prompt(lower):
                 self._send_sndcpy_enter()
+
+            if stripped:
+                self._sndcpy_last_output = lower
 
         try:
             proc.stdout.close()
         except Exception:  # noqa: BLE001 - best effort cleanup
             pass
+
+    def _should_ack_sndcpy_prompt(self, lower_line: str) -> bool:
+        if self._sndcpy_prompt_ack:
+            return False
+
+        stop_keywords = (
+            "stop",
+            "quit",
+            "exit",
+            "close",
+            "end",
+            "terminate",
+            "finish",
+            "abort",
+            "cancel",
+        )
+        if any(keyword in lower_line for keyword in stop_keywords):
+            return False
+
+        positive_keywords = (
+            "permission",
+            "allow",
+            "grant",
+            "start now",
+            "start audio",
+            "start playback",
+            "start capturing",
+            "start capture",
+            "continue",
+            "audio capture",
+            "once granted",
+            "after granting",
+            "tap start",
+            "tap \"start",
+        )
+
+        if any(keyword in lower_line for keyword in positive_keywords):
+            return True
+
+        previous = self._sndcpy_last_output
+        if previous and any(keyword in previous for keyword in positive_keywords):
+            return True
+
+        return False
 
     def _send_sndcpy_enter(self) -> None:
         if self._sndcpy_prompt_ack:
@@ -566,6 +617,7 @@ class ScrcpyController(QObject):
             proc.stdin.write("\n")
             proc.stdin.flush()
             self._sndcpy_prompt_ack = True
+            self._sndcpy_last_output = ""
         except Exception as exc:  # noqa: BLE001
             logger.debug("Unable to acknowledge sndcpy prompt: %s", exc)
 
@@ -588,6 +640,7 @@ class ScrcpyController(QObject):
         if not proc:
             self._sndcpy_proc = None
             self._sndcpy_prompt_ack = False
+            self._sndcpy_last_output = ""
             self._audio_requested = False
             return
 
@@ -611,6 +664,7 @@ class ScrcpyController(QObject):
             self._sndcpy_reader = None
             self._sndcpy_monitor = None
             self._sndcpy_prompt_ack = False
+            self._sndcpy_last_output = ""
             self._audio_requested = False
 
     def _clear_output_queue(self) -> None:
