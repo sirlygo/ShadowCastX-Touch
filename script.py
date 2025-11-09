@@ -181,6 +181,25 @@ class ScrcpyController(QObject):
 
         return self.proc is not None and self.proc.poll() is None
 
+    def video_dimensions(self) -> Optional[Tuple[int, int]]:
+        """Return the current video dimensions reported by the scrcpy window."""
+
+        if self.hwnd:
+            try:
+                left, top, right, bottom = win32gui.GetClientRect(self.hwnd)
+            except Exception as exc:  # noqa: BLE001 - win32 errors vary
+                logger.debug("Unable to read scrcpy window size: %s", exc)
+            else:
+                width = max(0, right - left)
+                height = max(0, bottom - top)
+                if width and height:
+                    dims = (width, height)
+                    if dims != self.resolution:
+                        self.resolution = dims
+                    return dims
+
+        return self.resolution
+
     def start(
         self,
         fps: int = DEFAULT_MAX_FPS,
@@ -412,6 +431,7 @@ class AndroidView(QWidget):
             win32con.SWP_NOSIZE | win32con.SWP_NOMOVE | win32con.SWP_NOZORDER | win32con.SWP_FRAMECHANGED,
         )
         self._resize_child()
+        QTimer.singleShot(150, self._resize_child)
 
     def resizeEvent(self, event) -> None:  # noqa: N802 (Qt API)
         super().resizeEvent(event)
@@ -426,15 +446,9 @@ class AndroidView(QWidget):
             y_off = 0
 
             aspect: Optional[float] = None
-            if self.controller.resolution and self.controller.resolution[1]:
-                aspect = self.controller.resolution[0] / self.controller.resolution[1]
-            else:
-                try:
-                    left, top, right, bottom = win32gui.GetClientRect(hwnd)
-                    if bottom - top:
-                        aspect = (right - left) / (bottom - top)
-                except Exception:
-                    aspect = None
+            dims = self.controller.video_dimensions()
+            if dims and dims[1]:
+                aspect = dims[0] / dims[1]
 
             if aspect and height:
                 available_aspect = width / height if height else aspect
