@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (
 import win32con, win32gui
 
 # ====== CONFIG ======
-SCRCPY_EXE = r"C:\Users\hilli\PycharmProjects\adbhelper\.venv\scrcpy\scrcpy.exe"
+SCRCPY_EXE: Optional[str] = None  # Let the helper resolve the executable dynamically.
 DEVICE_SERIAL: Optional[str] = None  # e.g. "R5CT60SV0RX"
 SCRCPY_TITLE = "Android (Embedded)"
 DEFAULT_MAX_FPS = 60
@@ -61,6 +61,11 @@ class ScrcpyController(QObject):
         self.poll.timeout.connect(self._find_window)
 
     def start(self, fps=DEFAULT_MAX_FPS, bitrate=DEFAULT_BITRATE):
+        if not self.serial:
+            # Refresh the device serial each time we try to start in case a new
+            # device has been plugged in since the controller was created.
+            self.serial = get_first_device()
+
         exe = _resolve_scrcpy()
         if not exe:
             self.error.emit("scrcpy.exe not found. Set SCRCPY_EXE to full path.")
@@ -81,8 +86,13 @@ class ScrcpyController(QObject):
             args.insert(1, "-s")
             args.insert(2, self.serial)
 
+        creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
         try:
-            self.proc = subprocess.Popen(args, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+            if creation_flags:
+                self.proc = subprocess.Popen(args, creationflags=creation_flags)
+            else:
+                self.proc = subprocess.Popen(args)
         except Exception as e:
             self.error.emit(str(e))
             return
@@ -332,14 +342,14 @@ class MainWindow(QWidget):
         self.btnStart = QPushButton("Start Stream")
         self.btnStop = QPushButton("Stop")
         self.btnScreenshot = QPushButton("Screenshot")
-        self.status = QLabel(f"Device: {device or 'Not Found'}")
+        self.status = QLabel(self._device_label())
         self.status.setStyleSheet("color:#bbb;")
 
         self.btnStart.clicked.connect(lambda: self.ctrl.start())
         self.btnStop.clicked.connect(self.ctrl.stop)
         self.btnScreenshot.clicked.connect(self._capture_screenshot)
-        self.ctrl.started.connect(lambda: self.status.setText(f"Device: {device} — STREAMING"))
-        self.ctrl.stopped.connect(lambda: self.status.setText(f"Device: {device} — STOPPED"))
+        self.ctrl.started.connect(self._on_stream_started)
+        self.ctrl.stopped.connect(self._on_stream_stopped)
         self.ctrl.error.connect(lambda m: QMessageBox.critical(self, "scrcpy", m))
 
         top = QHBoxLayout()
@@ -361,9 +371,17 @@ class MainWindow(QWidget):
         layout.addWidget(self.view)
         layout.setStretch(2, 1)
 
-        self.ctrl.started.connect(self._on_stream_started)
+    def _device_label(self) -> str:
+        return f"Device: {self.ctrl.serial or 'Not Found'}"
 
     def _on_stream_started(self):
+        self.status.setText(f"{self._device_label()} — STREAMING")
+        self._resize_window_to_device()
+
+    def _on_stream_stopped(self):
+        self.status.setText(f"{self._device_label()} — STOPPED")
+
+    def _resize_window_to_device(self):
         if not self.ctrl.resolution:
             return
 
