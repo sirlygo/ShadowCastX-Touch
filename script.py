@@ -156,7 +156,12 @@ class ScrcpyLaunchOptions:
         ]
         if self.stay_awake:
             args.append("--stay-awake")
-        if not self.audio:
+        if self.audio:
+            # Playback routing must be specified explicitly on recent scrcpy
+            # releases; otherwise the stream starts muted even when audio was
+            # requested. The "playback" target forwards audio to the host.
+            args.append("--audio-output=playback")
+        else:
             args.append("--no-audio")
         return args
 
