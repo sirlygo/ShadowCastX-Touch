@@ -54,6 +54,7 @@ class ScrcpyController(QObject):
         self.serial = serial
         self.proc = None
         self.hwnd = None
+        self.resolution = None
         self.poll = QTimer()
         self.poll.setInterval(250)
         self.poll.timeout.connect(self._find_window)
@@ -63,6 +64,8 @@ class ScrcpyController(QObject):
         if not exe:
             self.error.emit("scrcpy.exe not found. Set SCRCPY_EXE to full path.")
             return
+
+        self._update_resolution()
 
         args = [
             exe,
@@ -101,6 +104,32 @@ class ScrcpyController(QObject):
             self.poll.stop()
             self.started.emit()
 
+    def _update_resolution(self):
+        try:
+            cmd = ["adb"]
+            if self.serial:
+                cmd += ["-s", self.serial]
+            cmd += ["shell", "wm", "size"]
+            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode("utf-8", "ignore")
+            for line in out.splitlines():
+                if "Physical size:" in line:
+                    size = line.split(":", 1)[1].strip()
+                    break
+                if "Override size:" in line:
+                    size = line.split(":", 1)[1].strip()
+                    break
+            else:
+                size = None
+            if size:
+                size = size.split()[0]
+                if "x" in size:
+                    w, h = size.split("x", 1)
+                    self.resolution = (int(w), int(h))
+                    return
+        except Exception:
+            pass
+        self.resolution = None
+
 
 class AndroidView(QWidget):
     def __init__(self, controller: ScrcpyController):
@@ -131,14 +160,37 @@ class AndroidView(QWidget):
         hwnd = self.controller.hwnd
         if hwnd:
             r = self.rect()
-            win32gui.MoveWindow(hwnd, 0, 0, r.width(), r.height(), True)
+            width, height = r.width(), r.height()
+            x_off = 0
+            y_off = 0
+
+            if self.controller.resolution and self.controller.resolution[1] != 0:
+                aspect = self.controller.resolution[0] / self.controller.resolution[1]
+                available_aspect = width / height if height else aspect
+
+                target_width = width
+                target_height = height
+                if available_aspect > aspect:
+                    # Limit by height
+                    target_height = height
+                    target_width = max(1, int(round(target_height * aspect)))
+                else:
+                    # Limit by width
+                    target_width = width
+                    target_height = max(1, int(round(target_width / aspect)))
+
+                x_off = (width - target_width) // 2
+                y_off = (height - target_height) // 2
+                width, height = target_width, target_height
+
+            win32gui.MoveWindow(hwnd, x_off, y_off, width, height, True)
 
 
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Android — Embedded scrcpy")
-        self.resize(1100, 640)
+        self.resize(1400, 840)
 
         device = DEVICE_SERIAL or get_first_device()
 
