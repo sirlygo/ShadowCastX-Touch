@@ -2,7 +2,7 @@
 
 ShadowCastX-Touch is a lightweight PyQt5 application that embeds a [`scrcpy`](https://github.com/Genymobile/scrcpy) window, giving you a frameless, resizable view of a connected Android device. It adds a few quality-of-life enhancements on top of the default scrcpy experience:
 
-- Automatic detection of the first connected device via `adb`.
+- Automatic detection of the first connected device via `adb`, with manual device selection when multiple devices are present.
 - Automatic window embedding and resizing that respects the device aspect ratio.
 - Quick screenshots with an interactive cropper and PNG export.
 - Clean shutdown handling so the scrcpy process never lingers.
@@ -38,8 +38,9 @@ The application can be configured through module-level constants in `script.py` 
 python script.py
 ```
 
-4. Click **Start Stream** to launch the embedded scrcpy session.
-5. Use **Screenshot** to capture the current frame, optionally cropping before saving.
+4. (Optional) Pick a specific device from the **Device** drop-down, then click **Refresh** if you plug in a new device while the app is running.
+5. Click **Start Stream** to launch the embedded scrcpy session.
+6. Use **Screenshot** to capture the current frame, optionally cropping before saving.
 
 The application provides basic status messaging and automatically shuts down the scrcpy process when you close the window.
 
