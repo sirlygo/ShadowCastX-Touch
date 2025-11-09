@@ -548,7 +548,27 @@ class ScrcpyController(QObject):
             stripped = line.strip()
             if stripped:
                 logger.debug("sndcpy: %s", stripped)
-            if "press enter" in line.lower():
+
+            lower = line.lower()
+            if "press enter" in lower and not self._sndcpy_prompt_ack:
+                normalized = " ".join(lower.split())
+                stop_phrases = (
+                    "press enter to stop",
+                    "press enter to exit",
+                    "press enter to close",
+                    "press enter to quit",
+                )
+                if normalized.startswith(stop_phrases):
+                    # Ignore the shutdown prompt so the automatic
+                    # acknowledgement only applies to the startup request.
+                    continue
+
+                logger.debug("Automatically acknowledging sndcpy prompt: %s", stripped)
+
+                # Acknowledge the first startup "Press Enter" prompt so
+                # playback can begin automatically. Subsequent prompts are
+                # ignored because ``_sndcpy_prompt_ack`` will be ``True`` after
+                # the initial acknowledgement.
                 self._send_sndcpy_enter()
 
         try:
