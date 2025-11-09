@@ -548,8 +548,26 @@ class ScrcpyController(QObject):
             stripped = line.strip()
             if stripped:
                 logger.debug("sndcpy: %s", stripped)
-            if "press enter" in line.lower():
-                self._send_sndcpy_enter()
+
+            lower = line.lower()
+            if "press enter" in lower:
+                # Recent versions of sndcpy prompt the user to press Enter in
+                # two different situations:
+                #   1. After granting capture permission on the device, where
+                #      acknowledging the prompt should continue playback.
+                #   2. To stop playback ("Press Enter to stop"), which should
+                #      be ignored or audio ends immediately.
+                stop_keywords = (
+                    "stop",
+                    "quit",
+                    "exit",
+                    "close",
+                    "end",
+                    "terminate",
+                    "finish",
+                )
+                if not any(keyword in lower for keyword in stop_keywords):
+                    self._send_sndcpy_enter()
 
         try:
             proc.stdout.close()
