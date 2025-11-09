@@ -18,6 +18,7 @@ from PyQt5.QtCore import QEvent, QRect, QSize, Qt, QTimer, QObject, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFrame,
@@ -101,23 +102,31 @@ def _resolve_scrcpy() -> Optional[str]:
 def get_first_device() -> Optional[str]:
     """Return the first connected device according to ``adb devices``."""
 
+    devices = list_connected_devices()
+    return devices[0] if devices else None
+
+
+def list_connected_devices() -> List[str]:
+    """Return a list of connected device serials reported by ``adb devices``."""
+
     try:
         out = subprocess.check_output(
             ["adb", "devices"], stderr=subprocess.STDOUT
         ).decode("utf-8", "ignore")
     except (FileNotFoundError, subprocess.CalledProcessError) as exc:
         logger.warning("Unable to query adb devices: %s", exc)
-        return None
+        return []
 
+    devices: List[str] = []
     for line in out.splitlines()[1:]:
         if not line.strip():
             continue
         serial, *rest = line.split("\t")
         status = rest[0] if rest else ""
         if status.strip() == "device":
-            return serial.strip()
+            devices.append(serial.strip())
 
-    return None
+    return devices
 
 
 class ScrcpyController(QObject):
@@ -552,6 +561,15 @@ class MainWindow(QWidget):
         self.view = AndroidView(self.ctrl)
         self.view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
+        self.deviceCombo = QComboBox()
+        self.deviceCombo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.deviceCombo.setMinimumContentsLength(14)
+        self.deviceCombo.currentIndexChanged.connect(self._on_device_changed)
+
+        self.deviceRefresh = QPushButton("Refresh")
+        self.deviceRefresh.setToolTip("Rescan connected devices via adb.")
+        self.deviceRefresh.clicked.connect(self._refresh_devices)
+
         self.fpsSpin = QSpinBox()
         self.fpsSpin.setRange(1, 240)
         self.fpsSpin.setValue(DEFAULT_MAX_FPS)
@@ -577,7 +595,8 @@ class MainWindow(QWidget):
         self.btnStart = QPushButton("Start Stream")
         self.btnStop = QPushButton("Stop")
         self.btnScreenshot = QPushButton("Screenshot")
-        self.status = QLabel(self._device_label())
+        self._status_state = "READY"
+        self.status = QLabel()
         self.status.setStyleSheet("color:#bbb;")
 
         self.btnStart.clicked.connect(self._on_start_clicked)
@@ -592,6 +611,12 @@ class MainWindow(QWidget):
         config_layout = QHBoxLayout(config_bar)
         config_layout.setContentsMargins(0, 0, 0, 0)
         config_layout.setSpacing(12)
+
+        device_label = QLabel("Device:")
+        device_label.setStyleSheet("color:#bbb;")
+        config_layout.addWidget(device_label)
+        config_layout.addWidget(self.deviceCombo)
+        config_layout.addWidget(self.deviceRefresh)
 
         fps_label = QLabel("Max FPS:")
         fps_label.setStyleSheet("color:#bbb;")
@@ -628,10 +653,57 @@ class MainWindow(QWidget):
         layout.addWidget(self.view)
         layout.setStretch(2, 1)
 
+        self._refresh_devices(preferred=device)
+        self._set_status_state(self._status_state)
         self._update_controls(running=False)
 
     def _device_label(self) -> str:
-        return f"Device: {self.ctrl.serial or 'Not Found'}"
+        if hasattr(self, "deviceCombo"):
+            text = self.deviceCombo.currentText().strip()
+            if not text:
+                text = "Auto detect"
+            return f"Device: {text}"
+        return f"Device: {self.ctrl.serial or 'Auto detect'}"
+
+    def _set_status_state(self, state: str) -> None:
+        self._status_state = state
+        self.status.setText(f"{self._device_label()} — {state}")
+
+    def _sync_controller_serial(self) -> None:
+        if hasattr(self, "deviceCombo"):
+            self.ctrl.serial = self.deviceCombo.currentData()
+        else:
+            self.ctrl.serial = DEVICE_SERIAL or get_first_device()
+
+    def _on_device_changed(self) -> None:
+        self._sync_controller_serial()
+        self._set_status_state(self._status_state)
+
+    def _refresh_devices(self, preferred: Optional[str] = None) -> None:
+        devices = list_connected_devices()
+        if preferred is None:
+            preferred = self.ctrl.serial or self.deviceCombo.currentData()
+
+        self.deviceCombo.blockSignals(True)
+        self.deviceCombo.clear()
+        self.deviceCombo.addItem("Auto detect", None)
+
+        for serial in devices:
+            self.deviceCombo.addItem(serial, serial)
+
+        if preferred:
+            index = self.deviceCombo.findData(preferred)
+            if index == -1:
+                display = f"{preferred} (offline)"
+                self.deviceCombo.addItem(display, preferred)
+                index = self.deviceCombo.count() - 1
+            self.deviceCombo.setCurrentIndex(index)
+        else:
+            self.deviceCombo.setCurrentIndex(0)
+
+        self.deviceCombo.blockSignals(False)
+        self._sync_controller_serial()
+        self._set_status_state(self._status_state)
 
     def _update_controls(self, running: bool) -> None:
         self.btnStart.setEnabled(not running)
@@ -641,6 +713,8 @@ class MainWindow(QWidget):
         self.bitrateInput.setEnabled(not running)
         self.stayAwakeCheck.setEnabled(not running)
         self.audioCheck.setEnabled(not running)
+        self.deviceCombo.setEnabled(not running)
+        self.deviceRefresh.setEnabled(not running)
 
     def _gather_launch_settings(self) -> Optional[Tuple[int, str, bool, bool]]:
         bitrate = self._validated_bitrate()
@@ -681,12 +755,14 @@ class MainWindow(QWidget):
         return f"{normalized}{suffix}" if suffix else normalized
 
     def _on_stream_started(self) -> None:
-        self.status.setText(f"{self._device_label()} — STREAMING")
+        self._set_status_state("STREAMING")
         self._update_controls(running=True)
         self._resize_window_to_device()
+        if self.ctrl.serial:
+            self._refresh_devices(preferred=self.ctrl.serial)
 
     def _on_stream_stopped(self) -> None:
-        self.status.setText(f"{self._device_label()} — STOPPED")
+        self._set_status_state("STOPPED")
         self._update_controls(running=False)
 
     def _on_start_clicked(self) -> None:
@@ -695,11 +771,12 @@ class MainWindow(QWidget):
             return
 
         fps, bitrate, stay_awake, audio = settings
-        self.status.setText(f"{self._device_label()} — STARTING…")
+        self._sync_controller_serial()
+        self._set_status_state("STARTING…")
         self.ctrl.start(fps, bitrate, stay_awake=stay_awake, audio=audio)
 
     def _on_error(self, message: str) -> None:
-        self.status.setText(f"{self._device_label()} — ERROR")
+        self._set_status_state("ERROR")
         QMessageBox.critical(self, "scrcpy", message)
         self._update_controls(running=False)
 
@@ -708,7 +785,7 @@ class MainWindow(QWidget):
         self.audioCheck.setChecked(False)
         self.audioCheck.blockSignals(was_blocked)
         if self.ctrl.is_running:
-            self.status.setText(f"{self._device_label()} — STREAMING (NO AUDIO)")
+            self._set_status_state("STREAMING (NO AUDIO)")
         QMessageBox.warning(self, "scrcpy", message)
 
     def _resize_window_to_device(self) -> None:
