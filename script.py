@@ -491,6 +491,8 @@ class ScrcpyController(QObject):
         if lower_exe.endswith((".bat", ".cmd")):
             args = ["cmd.exe", "/c", exe]
 
+        exe_dir = os.path.dirname(os.path.abspath(exe)) or None
+
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         popen_kwargs = {
             "stdin": subprocess.PIPE,
@@ -510,10 +512,16 @@ class ScrcpyController(QObject):
                     args,
                     creationflags=creation_flags,
                     env=env,
+                    cwd=exe_dir,
                     **popen_kwargs,
                 )
             else:
-                proc = subprocess.Popen(args, env=env, **popen_kwargs)
+                proc = subprocess.Popen(
+                    args,
+                    env=env,
+                    cwd=exe_dir,
+                    **popen_kwargs,
+                )
         except FileNotFoundError:
             self._notify_audio_unavailable(
                 "sndcpy executable not found. Audio will be disabled for this session."
