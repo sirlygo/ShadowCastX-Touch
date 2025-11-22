@@ -48,6 +48,10 @@ DEFAULT_BITRATE = "16M"
 DEFAULT_SCREENSHOT_DIR = "images"
 
 BITRATE_PATTERN = re.compile(r"^\d+(?:\.\d+)?(?:[KMG](?:bit/s)?)?$", re.IGNORECASE)
+SNDCPY_STOP_PROMPT_PATTERN = re.compile(
+    r"press\s+enter\s+to\s+(stop|quit|exit|close|end|terminate|finish)\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -548,8 +552,17 @@ class ScrcpyController(QObject):
             stripped = line.strip()
             if stripped:
                 logger.debug("sndcpy: %s", stripped)
-            if "press enter" in line.lower():
-                self._send_sndcpy_enter()
+
+            lower = line.lower()
+            if "press enter" in lower:
+                # Recent versions of sndcpy prompt the user to press Enter in
+                # two different situations:
+                #   1. After granting capture permission on the device, where
+                #      acknowledging the prompt should continue playback.
+                #   2. To stop playback ("Press Enter to stop"), which should
+                #      be ignored or audio ends immediately.
+                if not SNDCPY_STOP_PROMPT_PATTERN.search(lower):
+                    self._send_sndcpy_enter()
 
         try:
             proc.stdout.close()
