@@ -192,11 +192,11 @@ def _resolve_scrcpy() -> Optional[str]:
 def _resolve_sndcpy() -> Optional[str]:
     """Return the path to the sndcpy executable if it can be resolved."""
 
-    if SNDCPY_EXE and os.path.exists(SNDCPY_EXE):
+    if SNDCPY_EXE and os.path.isfile(SNDCPY_EXE):
         return SNDCPY_EXE
 
     env = os.environ.get("SNDCPY_EXE")
-    if env and os.path.exists(env):
+    if env and os.path.isfile(env):
         return env
 
     from shutil import which
@@ -563,7 +563,7 @@ class ScrcpyController(QObject):
         if not proc or not proc.stdin:
             return
         try:
-            proc.stdin.write("\n")
+            proc.stdin.write(os.linesep)
             proc.stdin.flush()
             self._sndcpy_prompt_ack = True
         except Exception as exc:  # noqa: BLE001
