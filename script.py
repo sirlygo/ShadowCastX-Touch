@@ -548,7 +548,11 @@ class ScrcpyController(QObject):
             stripped = line.strip()
             if stripped:
                 logger.debug("sndcpy: %s", stripped)
-            if "press enter" in line.lower():
+            lower_line = line.lower()
+            if any(
+                prompt in lower_line
+                for prompt in ("press enter", "press any key", "press the enter")
+            ):
                 self._send_sndcpy_enter()
 
         try:
